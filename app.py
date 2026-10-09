@@ -125,7 +125,7 @@ with tabs[0]:
     
     c1, c2 = st.columns([1, 2])
     data_caricamento_t0 = c1.date_input("Data di acquisizione (T0):", datetime.today(), key="d_t0")
-    file_t0 = st.file_uploader("Trascina il file Excel delle Programmate (Es. 08/09/2026)", type=["xlsx", "xls"], key="file_t0")
+    file_t0 = st.file_uploader("Trascina il file Excel delle Programmate", type=["xlsx", "xls"], key="file_t0")
     
     if file_t0:
         df_t0 = pd.read_excel(file_t0)
@@ -183,7 +183,7 @@ with tabs[1]:
     
     c1, c2 = st.columns([1, 2])
     data_caricamento_t1 = c1.date_input("Data del controllo consuntivo (T1):", datetime.today(), key="d_t1")
-    file_t1 = st.file_uploader("Trascina il file Excel aggiornato (Es. 08/10/2026)", type=["xlsx", "xls"], key="file_t1")
+    file_t1 = st.file_uploader("Trascina il file Excel aggiornato con Fatture", type=["xlsx", "xls"], key="file_t1")
     
     if file_t1:
         df_t1 = pd.read_excel(file_t1)
@@ -246,7 +246,7 @@ with tabs[1]:
             st.error("Il file deve contenere 'Numero verifica', 'Fattura' e 'Data pianificata'.")
 
 # ---------------------------------------------------------
-# TAB 3: REPORT SINTETICO E TEMPORALE
+# TAB 3: REPORT SINTETICO E TEMPORALE CON CALENDARIO
 # ---------------------------------------------------------
 with tabs[2]:
     st.header("3. Report Sintetico & Tempi di Conversione")
@@ -255,18 +255,47 @@ with tabs[2]:
     conn.close()
     
     if not df_db.empty:
-        date_list = sorted(df_db['data_pianificata'].unique(), reverse=True)
-        data_sel = st.selectbox("📅 Seleziona la Data Pianificata da analizzare:", ["Tutte le date"] + date_list)
+        # Prepara le date per il calendario
+        df_db['data_pianificata_dt'] = pd.to_datetime(df_db['data_pianificata'], errors='coerce')
+        valid_dates = df_db['data_pianificata_dt'].dropna()
         
-        if data_sel == "Tutte le date":
-            df_giorno = df_db.copy()
+        if not valid_dates.empty:
+            min_date = valid_dates.min().date()
+            max_date = valid_dates.max().date()
         else:
-            df_giorno = df_db[df_db['data_pianificata'] == data_sel]
+            min_date = datetime.today().date()
+            max_date = datetime.today().date()
             
-        tot_prog = len(df_giorno)
-        tot_fat = len(df_giorno[df_giorno['stato'] == 'Fatturata'])
-        tot_att = len(df_giorno[df_giorno['stato'] == 'In Attesa'])
-        tot_non_pres = len(df_giorno[df_giorno['stato'] == 'Non Più Presente'])
+        st.markdown("### 📅 Filtro Periodo Pianificazione")
+        c1, c2 = st.columns([1, 2])
+        
+        filtro_tipo = c1.radio("Scegli l'ampiezza dell'analisi:", ["Tutto il database", "Seleziona Range Personalizzato"])
+        
+        if filtro_tipo == "Tutto il database":
+            df_filtrato = df_db.copy()
+            st.info(f"Stai analizzando l'intero storico: dal **{min_date.strftime('%d/%m/%Y')}** al **{max_date.strftime('%d/%m/%Y')}**")
+        else:
+            # Selezione Range Calendario
+            date_range = c2.date_input(
+                "Seleziona la data di Inizio e Fine:",
+                value=(min_date, max_date),
+                min_value=min_date,
+                max_value=max_date
+            )
+            
+            if isinstance(date_range, tuple) and len(date_range) == 2:
+                start_date, end_date = date_range
+                mask = (df_db['data_pianificata_dt'].dt.date >= start_date) & (df_db['data_pianificata_dt'].dt.date <= end_date)
+                df_filtrato = df_db.loc[mask]
+                st.info(f"Verifiche programmate dal **{start_date.strftime('%d/%m/%Y')}** al **{end_date.strftime('%d/%m/%Y')}**")
+            else:
+                st.warning("Seleziona anche la data di fine dal calendario per visualizzare il report.")
+                st.stop()
+                
+        tot_prog = len(df_filtrato)
+        tot_fat = len(df_filtrato[df_filtrato['stato'] == 'Fatturata'])
+        tot_att = len(df_filtrato[df_filtrato['stato'] == 'In Attesa'])
+        tot_non_pres = len(df_filtrato[df_filtrato['stato'] == 'Non Più Presente'])
         perc_conv = (tot_fat / tot_prog * 100) if tot_prog > 0 else 0.0
         
         st.subheader("1. Riepilogo Volumi")
@@ -279,7 +308,7 @@ with tabs[2]:
         st.divider()
         
         st.subheader(f"2. Età di Fatturazione (Dal caricamento $T_0$ al consuntivo $T_1$)")
-        df_fatturate = df_giorno[df_giorno['stato'] == 'Fatturata']
+        df_fatturate = df_filtrato[df_filtrato['stato'] == 'Fatturata']
         
         t1, t2, t3, t4 = st.columns(4)
         e_1_sett = len(df_fatturate[df_fatturate['fascia_tempo'] == '1. Entro 1 Settimana'])
@@ -294,8 +323,8 @@ with tabs[2]:
         
         st.divider()
         
-        st.subheader("Dettaglio Verifiche")
-        df_display = df_giorno[['numero_verifica', 'data_pianificata', 'tipo_impianto', 'codice_impianto', 'fattura', 'stato', 'data_t0', 'data_t1', 'giorni_trascorsi', 'fascia_tempo', 'importo']]
+        st.subheader("Dettaglio Verifiche Filtrate")
+        df_display = df_filtrato[['numero_verifica', 'data_pianificata', 'tipo_impianto', 'codice_impianto', 'fattura', 'stato', 'data_t0', 'data_t1', 'giorni_trascorsi', 'fascia_tempo', 'importo']]
         st.dataframe(df_display, use_container_width=True)
         
     else:
