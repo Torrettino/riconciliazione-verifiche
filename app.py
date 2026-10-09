@@ -18,6 +18,8 @@ def get_db_connection():
 def init_db():
     conn = get_db_connection()
     cursor = conn.cursor()
+    
+    # 1. Crea la tabella base se è la primissima volta
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS verifiche (
             numero_verifica INTEGER PRIMARY KEY,
@@ -30,11 +32,20 @@ def init_db():
             fattura TEXT,
             stato TEXT,
             data_t0 TEXT,
-            data_t1 TEXT,
-            giorni_trascorsi INTEGER,
-            fascia_tempo TEXT
+            data_t1 TEXT
         )
     ''')
+    
+    # 2. Controlla le colonne esistenti (Migrazione automatica senza perdere dati)
+    cursor.execute("PRAGMA table_info(verifiche)")
+    colonne_esistenti = [colonna[1] for colonna in cursor.fetchall()]
+    
+    # Se mancano le nuove colonne temporali, le aggiunge
+    if 'giorni_trascorsi' not in colonne_esistenti:
+        cursor.execute("ALTER TABLE verifiche ADD COLUMN giorni_trascorsi INTEGER")
+    if 'fascia_tempo' not in colonne_esistenti:
+        cursor.execute("ALTER TABLE verifiche ADD COLUMN fascia_tempo TEXT")
+        
     conn.commit()
     conn.close()
 
@@ -164,108 +175,4 @@ with tabs[1]:
                 
                 verifiche_presenti_t1 = set()
                 
-                # 1. Aggiornamento Fatture ed Età Temporale
-                for _, row in df_t1.iterrows():
-                    num_ver = int(row['Numero verifica'])
-                    verifiche_presenti_t1.add(num_ver)
-                    
-                    fatt_raw = str(row['Fattura']).strip()
-                    num_fat = fatt_raw if pd.notna(row['Fattura']) and fatt_raw.lower() != 'nan' and fatt_raw != '' else None
-                    
-                    if num_fat:
-                        cursor.execute("SELECT data_t0 FROM verifiche WHERE numero_verifica = ?", (num_ver,))
-                        res = cursor.fetchone()
-                        
-                        giorni = None
-                        fascia = "N/D"
-                        if res and res[0]:
-                            dt0_obj = datetime.strptime(res[0], '%Y-%m-%d').date()
-                            giorni = (dt1_obj - dt0_obj).days
-                            
-                            if giorni <= 7: fascia = "1. Entro 1 Settimana"
-                            elif giorni <= 14: fascia = "2. Entro 2 Settimane"
-                            elif giorni <= 30: fascia = "3. Entro 1 Mese"
-                            else: fascia = "4. Oltre 1 Mese"
-                        
-                        cursor.execute('''
-                            UPDATE verifiche 
-                            SET fattura = ?, stato = 'Fatturata', data_t1 = ?, giorni_trascorsi = ?, fascia_tempo = ?
-                            WHERE numero_verifica = ?
-                        ''', (num_fat, dt1_str, giorni, fascia, num_ver))
-                
-                # 2. Identificazione Chirurgica "Non Più Presenti"
-                if date_presenti_t1:
-                    placeholders = ','.join('?' for _ in date_presenti_t1)
-                    query = f"SELECT numero_verifica FROM verifiche WHERE stato != 'Fatturata' AND data_pianificata IN ({placeholders})"
-                    cursor.execute(query, date_presenti_t1)
-                    in_attesa_db = cursor.fetchall()
-                    
-                    for (nv,) in in_attesa_db:
-                        if nv not in verifiche_presenti_t1:
-                            cursor.execute("UPDATE verifiche SET stato = 'Non Più Presente' WHERE numero_verifica = ?", (nv,))
-                
-                conn.commit()
-                conn.close()
-                st.success(f"Riconciliazione completata con successo rispetto alla data $T_1 = {dt1_str}$!")
-        else:
-            st.error("Il file deve contenere 'Numero verifica', 'Fattura' e 'Data pianificata'.")
-
-# ---------------------------------------------------------
-# TAB 3: REPORT SINTETICO E TEMPORALE
-# ---------------------------------------------------------
-with tabs[2]:
-    st.header("3. Report Sintetico & Tempi di Conversione")
-    conn = get_db_connection()
-    df_db = pd.read_sql_query("SELECT * FROM verifiche", conn)
-    conn.close()
-    
-    if not df_db.empty:
-        date_list = sorted(df_db['data_pianificata'].unique(), reverse=True)
-        data_sel = st.selectbox("📅 Seleziona la Data Pianificata da analizzare:", ["Tutte le date"] + date_list)
-        
-        # Filtraggio
-        if data_sel == "Tutte le date":
-            df_giorno = df_db.copy()
-        else:
-            df_giorno = df_db[df_db['data_pianificata'] == data_sel]
-            
-        tot_prog = len(df_giorno)
-        tot_fat = len(df_giorno[df_giorno['stato'] == 'Fatturata'])
-        tot_att = len(df_giorno[df_giorno['stato'] == 'In Attesa'])
-        tot_non_pres = len(df_giorno[df_giorno['stato'] == 'Non Più Presente'])
-        perc_conv = (tot_fat / tot_prog * 100) if tot_prog > 0 else 0.0
-        
-        # -- 1. RIEPILOGO GENERALE --
-        st.subheader("1. Riepilogo Volumi")
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Totale Programmate", tot_prog)
-        m2.metric("Diventate Fattura", tot_fat, f"{perc_conv:.1f}% di conversione")
-        m3.metric("In Attesa di Fattura", tot_att)
-        m4.metric("Non Più Presenti", tot_non_pres)
-        
-        st.divider()
-        
-        # -- 2. CONFRONTO TEMPORALE --
-        st.subheader(f"2. Età di Fatturazione (Dal caricamento $T_0$ al consuntivo $T_1$)")
-        df_fatturate = df_giorno[df_giorno['stato'] == 'Fatturata']
-        
-        t1, t2, t3, t4 = st.columns(4)
-        e_1_sett = len(df_fatturate[df_fatturate['fascia_tempo'] == '1. Entro 1 Settimana'])
-        e_2_sett = len(df_fatturate[df_fatturate['fascia_tempo'] == '2. Entro 2 Settimane'])
-        e_1_mese = len(df_fatturate[df_fatturate['fascia_tempo'] == '3. Entro 1 Mese'])
-        oltre_mese = len(df_fatturate[df_fatturate['fascia_tempo'] == '4. Oltre 1 Mese'])
-        
-        t1.metric("≤ 7 Giorni", e_1_sett, f"{(e_1_sett/tot_fat*100):.1f}% del fatturato" if tot_fat>0 else "0%")
-        t2.metric("8 - 14 Giorni", e_2_sett, f"{(e_2_sett/tot_fat*100):.1f}% del fatturato" if tot_fat>0 else "0%")
-        t3.metric("15 - 30 Giorni", e_1_mese, f"{(e_1_mese/tot_fat*100):.1f}% del fatturato" if tot_fat>0 else "0%")
-        t4.metric("> 30 Giorni", oltre_mese, f"{(oltre_mese/tot_fat*100):.1f}% del fatturato" if tot_fat>0 else "0%")
-        
-        st.divider()
-        
-        # -- 3. DATI GREZZI --
-        st.subheader("Dettaglio Verifiche")
-        df_display = df_giorno[['numero_verifica', 'data_pianificata', 'tipo_impianto', 'codice_impianto', 'fattura', 'stato', 'data_t0', 'data_t1', 'giorni_trascorsi', 'fascia_tempo', 'importo']]
-        st.dataframe(df_display, use_container_width=True)
-        
-    else:
-        st.info("Nessun dato salvato nel sistema. Effettua un primo caricamento nel Tab 1.")
+                # 1. Aggior
