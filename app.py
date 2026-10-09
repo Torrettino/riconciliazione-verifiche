@@ -13,11 +13,8 @@ from io import BytesIO
 # CONFIGURAZIONE PAGINA E SICUREZZA
 # ---------------------------------------------------------
 st.set_page_config(page_title="Riconciliazione Verifiche Impianti", page_icon="📊", layout="wide")
-st.write("Directory di lavoro corrente:", os.getcwd())
-st.write("Esiste .streamlit/secrets.toml?", os.path.exists(os.path.join(os.getcwd(), ".streamlit", "secrets.toml")))
 
 # Password letta prioritariamente da variabile d'ambiente, altrimenti da st.secrets.
-# Accesso reso robusto per evitare fallimenti silenziosi.
 PASSWORD_ACCESSO = os.environ.get("VERIFICHE_PASSWORD")
 if not PASSWORD_ACCESSO:
     try:
@@ -38,7 +35,7 @@ logging.basicConfig(
 logger = logging.getLogger("verifiche")
 
 # ---------------------------------------------------------
-# COSTANTI
+# COSTANTI E MAPPATURE
 # ---------------------------------------------------------
 DB_NAME = "verifiche.db"
 BACKUP_DIR = "backups"
@@ -62,15 +59,16 @@ RINOMINA = {
     'codice_impianto': 'Codice impianto', 'data_pianificata': 'Data pianificata', 'stato': 'Stato',
     'fattura': 'Fattura', 'data_t0': 'Data T0', 'data_t1': 'Data T1',
     'giorni_trascorsi': 'Giorni dal T0', 'giorni_da_pianificata': 'Giorni da data pianificata',
-    'fascia_tempo': 'Fascia'
+    'fascia_tempo': 'Fascia', 'verbale': 'Verbale', 'esito_verifica': 'Esito verifica',
+    'verbale_da_inviare': 'Verbale da inviare / Approvato'
 }
 
 # =========================================================
-# ==== LOGICA (nessuna chiamata a Streamlit in questa sezione) ====
+# ==== LOGICA E FUNZIONALITÀ DI ELABORAZIONE DATI ====
 # =========================================================
+
 def pulisci_testo(v):
-    """Normalizza un valore di cella: None se vuoto/NaN, testo pulito altrimenti.
-    Toglie anche il '.0' finale dei numeri letti come decimali (es. fattura 2026001234.0)."""
+    """Normalizza un valore di cella: None se vuoto/NaN, testo pulito altrimenti."""
     if v is None:
         return None
     try:
@@ -86,8 +84,7 @@ def pulisci_testo(v):
     return s
 
 def _parse_una_data(v):
-    """Restituisce 'YYYY-MM-DD' oppure None. Le date ISO non vengono mai scambiate giorno/mese;
-    le date testuali (es. 01/03/2026) sono lette come giorno/mese/anno."""
+    """Restituisce 'YYYY-MM-DD' oppure None."""
     t = pulisci_testo(v)
     if t is None:
         return None
@@ -98,7 +95,7 @@ def _parse_una_data(v):
     return None if pd.isna(dt) else dt.strftime('%Y-%m-%d')
 
 def tipo_da_protocollo(protocollo):
-    """Reparto in base al sezionale; None se non è /A o /E."""
+    """Identifica il reparto dal sezionale (/A per Ascensori, /E per Messa a Terra)."""
     p = (pulisci_testo(protocollo) or '').upper()
     if p.endswith('/A'):
         return TIPO_A
@@ -118,14 +115,14 @@ def fascia_da_giorni(giorni):
     return FASCE[3]
 
 def leggi_excel(file):
-    """Legge l'Excel come testo (evita fatture '123.0') e pulisce i nomi colonna."""
+    """Legge l'Excel come testo e pulisce i nomi delle colonne."""
     df = pd.read_excel(file, dtype=str)
     df.columns = [str(c).strip() for c in df.columns]
     return df
 
 @contextmanager
 def db_connection(commit=False):
-    """Apre e chiude sempre la connessione; con commit=True salva, in caso di errore annulla."""
+    """Gestisce l'apertura e la chiusura della connessione al database SQLite."""
     conn = sqlite3.connect(DB_NAME)
     try:
         yield conn
@@ -138,6 +135,7 @@ def db_connection(commit=False):
         conn.close()
 
 def init_db():
+    """Inizializza la struttura del database e aggiunge eventuali nuove colonne mancanti."""
     with db_connection(commit=True) as conn:
         cursor = conn.cursor()
         cursor.execute('''
@@ -157,17 +155,20 @@ def init_db():
         ''')
         cursor.execute("PRAGMA table_info(verifiche)")
         colonne = [c[1] for c in cursor.fetchall()]
-        if 'giorni_trascorsi' not in colonne:
-            cursor.execute("ALTER TABLE verifiche ADD COLUMN giorni_trascorsi INTEGER")
-        if 'fascia_tempo' not in colonne:
-            cursor.execute("ALTER TABLE verifiche ADD COLUMN fascia_tempo TEXT")
-        if 'giorni_da_pianificata' not in colonne:
-            cursor.execute("ALTER TABLE verifiche ADD COLUMN giorni_da_pianificata INTEGER")
-            cursor.execute('''
-                UPDATE verifiche
-                SET giorni_da_pianificata = CAST(ROUND(julianday(data_t1) - julianday(data_pianificata)) AS INTEGER)
-                WHERE stato = 'Fatturata' AND data_t1 IS NOT NULL AND data_pianificata IS NOT NULL
-            ''')
+        
+        # Aggiornamento dello schema con colonne per calcoli temporali e verbali
+        nuove_colonne = {
+            'giorni_trascorsi': 'INTEGER',
+            'fascia_tempo': 'TEXT',
+            'giorni_da_pianificata': 'INTEGER',
+            'verbale': 'TEXT',
+            'esito_verifica': 'TEXT',
+            'verbale_da_inviare': 'TEXT'
+        }
+        for col_name, col_type in nuove_colonne.items():
+            if col_name not in colonne:
+                cursor.execute(f"ALTER TABLE verifiche ADD COLUMN {col_name} {col_type}")
+
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS verifiche_extra (
                 numero_verifica INTEGER PRIMARY KEY,
@@ -180,7 +181,7 @@ def init_db():
         ''')
 
 def crea_backup(motivo="auto"):
-    """Copia di sicurezza del database prima di ogni modifica. Restituisce il percorso o None."""
+    """Crea una copia di sicurezza (.db) prima di apportare modifiche."""
     if not os.path.exists(DB_NAME):
         return None
     os.makedirs(BACKUP_DIR, exist_ok=True)
@@ -212,7 +213,7 @@ def ultimo_backup():
     return datetime.fromtimestamp(ts)
 
 def valida_db_caricato(raw):
-    """Controlla che il file sia un database SQLite integro con la tabella 'verifiche'."""
+    """Verifica l'integrità di un file database caricato."""
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
     try:
         tmp.write(raw)
@@ -225,11 +226,7 @@ def valida_db_caricato(raw):
                     return False, "Il file è danneggiato (controllo di integrità fallito)."
                 tabelle = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                 if 'verifiche' not in tabelle:
-                    return False, "Il file non contiene la tabella 'verifiche': non è un backup di questa app."
-                colonne = {r[1] for r in c.execute("PRAGMA table_info(verifiche)")}
-                mancanti = COLONNE_VERIFICHE_BASE - colonne
-                if mancanti:
-                    return False, f"Nella tabella 'verifiche' mancano le colonne: {', '.join(sorted(mancanti))}."
+                    return False, "Il file non contiene la tabella 'verifiche'."
                 n = c.execute("SELECT COUNT(*) FROM verifiche").fetchone()[0]
                 return True, f"File valido: contiene {n} verifiche."
             finally:
@@ -244,27 +241,31 @@ def valida_db_caricato(raw):
 
 def carica_stato_db(conn):
     df = pd.read_sql_query(
-        "SELECT numero_verifica, protocollo, tipo_impianto, data_pianificata, data_t0, stato FROM verifiche", conn
+        "SELECT numero_verifica, protocollo, tipo_impianto, data_pianificata, data_t0, stato, verbale, esito_verifica, verbale_da_inviare FROM verifiche", conn
     )
     return df.set_index('numero_verifica')
 
 def carica_numeri_extra(conn):
     return {r[0] for r in conn.execute("SELECT numero_verifica FROM verifiche_extra")}
 
-# ---------------- T0 ----------------
+# ---------------- PREPARAZIONE E SALVATAGGIO T0 ----------------
 def prepara_t0(df_raw):
-    """Pulisce il file T0. Restituisce (dataframe valido, info sugli scarti)."""
+    """Normalizza e pulisce le righe dell'Excel delle programmate (T0)."""
     d = pd.DataFrame({
         'num': pd.to_numeric(df_raw['Numero verifica'].apply(pulisci_testo), errors='coerce'),
         'protocollo': df_raw['Protocollo'].apply(lambda x: (pulisci_testo(x) or '').upper()),
         'codice_impianto': df_raw['Codice impianto'].apply(pulisci_testo),
         'codice_fiscale': df_raw['Codice fiscale'].apply(pulisci_testo),
         'data_pian': df_raw['Data pianificata'].apply(_parse_una_data),
+        'verbale': df_raw['Verbale'].apply(pulisci_testo) if 'Verbale' in df_raw.columns else None,
+        'esito_verifica': df_raw['Esito verifica'].apply(pulisci_testo) if 'Esito verifica' in df_raw.columns else None,
+        'verbale_da_inviare': df_raw['Verbale da inviare'].apply(pulisci_testo) if 'Verbale da inviare' in df_raw.columns else None,
     })
     if 'Importo' in df_raw.columns:
         d['importo'] = pd.to_numeric(df_raw['Importo'].astype(str).str.replace(',', '.', regex=False), errors='coerce')
     else:
         d['importo'] = float('nan')
+
     d['tipo'] = d['protocollo'].apply(tipo_da_protocollo)
     m_num = d['num'].isna()
     m_data = ~m_num & d['data_pian'].isna()
@@ -298,9 +299,11 @@ def pianifica_t0(df_t0, db, extra_nums):
     return {'nuove': nuove, 'presenti': presenti, 'date_cambiate': date_cambiate, 'da_extra': da_extra}
 
 SQL_UPSERT_T0 = '''
-    INSERT INTO verifiche (numero_verifica, protocollo, codice_impianto, codice_fiscale, data_pianificata,
-                           importo, tipo_impianto, fattura, stato, data_t0)
-    VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'In Attesa', ?)
+    INSERT INTO verifiche (
+        numero_verifica, protocollo, codice_impianto, codice_fiscale, data_pianificata,
+        importo, tipo_impianto, fattura, stato, data_t0, verbale, esito_verifica, verbale_da_inviare
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'In Attesa', ?, ?, ?, ?)
     ON CONFLICT(numero_verifica) DO UPDATE SET
         protocollo=excluded.protocollo,
         codice_impianto=excluded.codice_impianto,
@@ -308,14 +311,17 @@ SQL_UPSERT_T0 = '''
         data_pianificata=excluded.data_pianificata,
         importo=COALESCE(excluded.importo, verifiche.importo),
         tipo_impianto=excluded.tipo_impianto,
-        stato = CASE WHEN verifiche.fattura IS NULL THEN 'In Attesa' ELSE verifiche.stato END
+        stato = CASE WHEN verifiche.fattura IS NULL THEN 'In Attesa' ELSE verifiche.stato END,
+        verbale = COALESCE(excluded.verbale, verifiche.verbale),
+        esito_verifica = COALESCE(excluded.esito_verifica, verifiche.esito_verifica),
+        verbale_da_inviare = COALESCE(excluded.verbale_da_inviare, verifiche.verbale_da_inviare)
 '''
 
 def applica_t0(conn, df_t0, dt0_str):
-    """data_t0 NON viene aggiornata se la verifica esiste già: resta la data di prima acquisizione."""
     righe = [
         (int(r.num), r.protocollo, r.codice_impianto, r.codice_fiscale, r.data_pian,
-         None if pd.isna(r.importo) else float(r.importo), r.tipo, dt0_str)
+         None if pd.isna(r.importo) else float(r.importo), r.tipo, dt0_str,
+         r.verbale, r.esito_verifica, r.verbale_da_inviare)
         for r in df_t0.itertuples()
     ]
     cur = conn.cursor()
@@ -323,14 +329,17 @@ def applica_t0(conn, df_t0, dt0_str):
     cur.executemany("DELETE FROM verifiche_extra WHERE numero_verifica = ?", [(int(n),) for n in df_t0['num']])
     logger.info("T0 applicato: %d verifiche", len(righe))
 
-# ---------------- T1 ----------------
+# ---------------- PREPARAZIONE E SALVATAGGIO T1 ----------------
 def prepara_t1(df_raw):
     d = pd.DataFrame({
         'num': pd.to_numeric(df_raw['Numero verifica'].apply(pulisci_testo), errors='coerce'),
-        'fattura': df_raw['Fattura'].apply(pulisci_testo),
+        'fattura': df_raw['Fattura'].apply(pulisci_testo) if 'Fattura' in df_raw.columns else None,
         'data_pian': df_raw['Data pianificata'].apply(_parse_una_data),
         'protocollo': (df_raw['Protocollo'].apply(lambda x: (pulisci_testo(x) or '').upper())
                        if 'Protocollo' in df_raw.columns else None),
+        'verbale': df_raw['Verbale'].apply(pulisci_testo) if 'Verbale' in df_raw.columns else None,
+        'esito_verifica': df_raw['Esito verifica'].apply(pulisci_testo) if 'Esito verifica' in df_raw.columns else None,
+        'verbale_da_inviare': df_raw['Verbale da inviare'].apply(pulisci_testo) if 'Verbale da inviare' in df_raw.columns else None,
     })
     m_num = d['num'].isna()
     d = d[~m_num].copy()
@@ -346,7 +355,6 @@ def _txt(v):
     return v if isinstance(v, str) and v != '' else None
 
 def rileva_reparti_t1(d, db):
-    """Conta a quale reparto appartengono le righe del T1."""
     conteggio = {}
     db_tipi = db['tipo_impianto'].to_dict()
     for r in d.itertuples():
@@ -361,9 +369,11 @@ def rileva_reparti_t1(d, db):
     return conteggio
 
 def _processa_riga_t1(r, db_d, dt1, dt1_str):
-    """Elabora una singola riga del T1. Restituisce una tupla di esito."""
     num = int(r.num)
     fattura = _txt(r.fattura)
+    verbale = _txt(r.verbale)
+    esito = _txt(r.esito_verifica)
+    v_inviare = _txt(r.verbale_da_inviare)
     rec = db_d.get(num)
 
     if rec is None:
@@ -384,14 +394,14 @@ def _processa_riga_t1(r, db_d, dt1, dt1_str):
                 return 'data_incoerente', num
         if rec['data_pianificata']:
             giorni_pian = (dt1 - datetime.strptime(rec['data_pianificata'], '%Y-%m-%d').date()).days
-        return 'fatturata', (fattura, dt1_str, giorni, fascia_da_giorni(giorni), giorni_pian, num)
+        return 'fatturata', (fattura, dt1_str, giorni, fascia_da_giorni(giorni), giorni_pian, verbale, esito, v_inviare, num)
 
     if rec['stato'] == 'Non Più Presente':
-        return 'riattivata', num
-    return 'senza_fattura', None
+        return 'riattivata', (verbale, esito, v_inviare, num)
+        
+    return 'senza_fattura', (verbale, esito, v_inviare, num)
 
 def _calcola_npp(db_d, presenti, date_t1, reparti_coperti):
-    """Identifica le verifiche In Attesa che devono diventare Non Più Presenti."""
     base_attesa = 0
     npp = []
     for num, rec in db_d.items():
@@ -404,14 +414,12 @@ def _calcola_npp(db_d, presenti, date_t1, reparti_coperti):
     return base_attesa, npp
 
 def pianifica_t1(d, dt1, db, reparti_coperti):
-    """Calcola l'effetto del file T1 senza scrivere nulla.
-    La logica è stata suddivisa per chiarezza e manutenibilità."""
     dt1_str = dt1.strftime('%Y-%m-%d')
     db_d = db.to_dict('index')
     presenti = set(d['num'].tolist())
     date_t1 = {x for x in (_txt(v) for v in d['data_pian']) if x}
 
-    fatturate, riattivate, extra, date_incoerenti = [], [], [], []
+    fatturate, riattivate, extra, date_incoerenti, aggiornamenti_verbali = [], [], [], [], []
     gia_fatturate = senza_fattura = scartate_altro = 0
 
     for r in d.itertuples():
@@ -419,13 +427,16 @@ def pianifica_t1(d, dt1, db, reparti_coperti):
         if esito == 'fatturata':
             fatturate.append(payload)
         elif esito == 'riattivata':
-            riattivate.append(payload)
+            riattivate.append(payload[3])
+            aggiornamenti_verbali.append(payload)
         elif esito == 'extra':
             extra.append(payload)
         elif esito == 'gia_fatturata':
             gia_fatturate += 1
         elif esito == 'senza_fattura':
             senza_fattura += 1
+            if payload and any(payload[:3]):
+                aggiornamenti_verbali.append(payload)
         elif esito == 'scartata_altro':
             scartate_altro += 1
         elif esito == 'data_incoerente':
@@ -441,6 +452,7 @@ def pianifica_t1(d, dt1, db, reparti_coperti):
         'reparti_coperti': list(reparti_coperti),
         'fatturate': fatturate,
         'riattivate': riattivate,
+        'aggiornamenti_verbali': aggiornamenti_verbali,
         'extra': extra,
         'npp': npp,
         'gia_fatturate': gia_fatturate,
@@ -478,18 +490,25 @@ def applica_t1(conn, piano):
     cur = conn.cursor()
     cur.executemany('''
         UPDATE verifiche
-        SET fattura = ?, stato = 'Fatturata', data_t1 = ?, giorni_trascorsi = ?, fascia_tempo = ?, giorni_da_pianificata = ?
+        SET fattura = ?, stato = 'Fatturata', data_t1 = ?, giorni_trascorsi = ?, fascia_tempo = ?, giorni_da_pianificata = ?,
+            verbale = COALESCE(?, verbale), esito_verifica = COALESCE(?, esito_verifica), verbale_da_inviare = COALESCE(?, verbale_da_inviare)
         WHERE numero_verifica = ?
     ''', piano['fatturate'])
+    
+    cur.executemany('''
+        UPDATE verifiche
+        SET verbale = COALESCE(?, verbale), esito_verifica = COALESCE(?, esito_verifica), verbale_da_inviare = COALESCE(?, verbale_da_inviare)
+        WHERE numero_verifica = ?
+    ''', piano['aggiornamenti_verbali'])
+
     cur.executemany("UPDATE verifiche SET stato = 'In Attesa' WHERE numero_verifica = ?",
                     [(n,) for n in piano['riattivate']])
     cur.executemany("UPDATE verifiche SET stato = 'Non Più Presente' WHERE numero_verifica = ?",
                     [(n,) for n in piano['npp']])
     cur.executemany(SQL_UPSERT_EXTRA, piano['extra'])
-    logger.info("T1 applicato: fatturate=%d, npp=%d, riattivate=%d, extra=%d",
-                len(piano['fatturate']), len(piano['npp']), len(piano['riattivate']), len(piano['extra']))
+    logger.info("T1 applicato con successo.")
 
-# ---------------- REPORT ----------------
+# ---------------- REPORTISTICA ED ESPORTAZIONE ----------------
 def calcola_metriche(df):
     fat = df[df['stato'] == 'Fatturata']
     m = {
@@ -533,8 +552,9 @@ def costruisci_excel(df_filtrato, df_extra, descrizione_periodo):
         })
     riepilogo = pd.DataFrame(righe)
     col_det = ['numero_verifica', 'protocollo', 'tipo_impianto', 'codice_impianto', 'data_pianificata', 'stato',
-               'fattura', 'data_t0', 'data_t1', 'giorni_trascorsi', 'giorni_da_pianificata', 'fascia_tempo']
-    col_lista = ['numero_verifica', 'protocollo', 'tipo_impianto', 'codice_impianto', 'data_pianificata', 'data_t0']
+               'verbale', 'esito_verifica', 'verbale_da_inviare', 'fattura', 'data_t0', 'data_t1', 
+               'giorni_trascorsi', 'giorni_da_pianificata', 'fascia_tempo']
+    col_lista = ['numero_verifica', 'protocollo', 'tipo_impianto', 'codice_impianto', 'data_pianificata', 'verbale', 'esito_verifica', 'verbale_da_inviare', 'data_t0']
     col_extra = ['numero_verifica', 'protocollo', 'tipo_impianto', 'data_pianificata', 'fattura', 'data_t1']
     buf = BytesIO()
     with pd.ExcelWriter(buf, engine='openpyxl') as writer:
@@ -555,10 +575,72 @@ def costruisci_excel(df_filtrato, df_extra, descrizione_periodo):
     return buf.getvalue()
 
 # =========================================================
-# ==== FINE LOGICA ====
+# ==== RENDICONTAZIONE GIORNALIERA ====
+# =========================================================
+def mostra_rendicontazione_giornaliera(df):
+    """Calcola e mostra la rendicontazione giornaliera dell'avanzamento dei verbali e delle fatture."""
+    st.markdown("---")
+    st.subheader("📅 Rendicontazione Giornaliera e Avanzamento Verbali")
+    
+    if df.empty:
+        st.info("Nessuna verifica trovata per il periodo selezionato.")
+        return
+
+    df_a = df.copy()
+    
+    # Rilevamento stato del verbale e approvazione
+    df_a['Ha_Verbale'] = df_a['verbale'].notna()
+    df_a['Approvato_Ingegnere'] = df_a['verbale_da_inviare'].astype(str).str.upper() == 'SI'
+    df_a['Fatturata'] = df_a['fattura'].notna()
+    
+    # Classificazione stati
+    df_a['In_Attesa_Verbale'] = ~df_a['Ha_Verbale']
+    df_a['In_Attesa_Ingegnere'] = df_a['Ha_Verbale'] & ~df_a['Fatturata'] & ~df_a['Approvato_Ingegnere']
+    df_a['Pronta_da_Fatturare'] = df_a['Ha_Verbale'] & ~df_a['Fatturata'] & df_a['Approvato_Ingegnere']
+
+    # Raggruppamento per data pianificata
+    giornaliero = df_a.groupby('data_pianificata').agg(
+        Totale_Eseguite=('numero_verifica', 'count'),
+        In_Attesa_Verbale=('In_Attesa_Verbale', 'sum'),
+        In_Attesa_Ingegnere=('In_Attesa_Ingegnere', 'sum'),
+        Pronte_da_Fatturare=('Pronta_da_Fatturare', 'sum'),
+        Fatturate=('Fatturata', 'sum')
+    ).reset_index()
+
+    giornaliero.columns = [
+        'Data Verifica', 'Totale Eseguite', 'Senza Verbale', 
+        'In Attesa Ingegnere', 'Pronte da Fatturare', 'Fatturate'
+    ]
+
+    # Metriche sintetiche complessive
+    tot_eseguite = giornaliero['Totale Eseguite'].sum()
+    tot_fatturate = giornaliero['Fatturate'].sum()
+    tot_pronte = giornaliero['Pronte da Fatturare'].sum()
+    tot_attesa_ing = giornaliero['In Attesa Ingegnere'].sum()
+    tot_senza_verbale = giornaliero['Senza Verbale'].sum()
+
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("Totale Eseguite", tot_eseguite)
+    k2.metric("Senza Verbale", tot_senza_verbale)
+    k3.metric("In Attesa Ingegnere", tot_attesa_ing)
+    k4.metric("Pronte da Fatturare", tot_pronte)
+    k5.metric("Fatturate", tot_fatturate, f"{(tot_fatturate/tot_eseguite*100 if tot_eseguite else 0):.1f}%")
+
+    # Tabella e Grafico
+    st.markdown("##### Tabella Dettaglio Giornaliero")
+    st.dataframe(giornaliero, use_container_width=True, hide_index=True)
+
+    st.markdown("##### Grafico Distribuzione Giornaliera")
+    st.bar_chart(
+        giornaliero.set_index('Data Verifica')[
+            ['Fatturate', 'Pronte da Fatturare', 'In Attesa Ingegnere', 'Senza Verbale']
+        ]
+    )
+
+# =========================================================
+# ==== INTERFACCIA UTENTE E AUTENTICAZIONE ====
 # =========================================================
 def check_password():
-    """Restituisce True se l'utente ha inserito la password corretta."""
     if "password_correct" not in st.session_state:
         st.session_state["password_correct"] = False
     if not st.session_state["password_correct"]:
@@ -579,13 +661,10 @@ if not check_password():
 
 init_db()
 
-# ---------------------------------------------------------
-# SIDEBAR: BACKUP E SALVATAGGIO DATI
-# ---------------------------------------------------------
+# ---------------- SIDEBAR ----------------
 with st.sidebar:
     st.header("💾 Gestione Sicurezza Dati")
-    st.info("Prima di ogni salvataggio l'app crea un backup automatico nella cartella 'backups'. "
-            "Scarica comunque periodicamente una copia sul tuo PC: su hosting cloud la cartella può andare persa al riavvio.")
+    st.info("Prima di ogni salvataggio l'app crea un backup automatico nella cartella 'backups'.")
     ub = ultimo_backup()
     st.caption(f"Ultimo backup automatico: {ub.strftime('%d/%m/%Y %H:%M')}" if ub else "Nessun backup automatico ancora creato.")
     if os.path.exists(DB_NAME):
@@ -613,23 +692,19 @@ with st.sidebar:
                     f.write(raw_db)
                 init_db()
                 logger.info("Database ripristinato da file caricato")
-                st.success("Database ripristinato con successo (copia del database precedente salvata in 'backups'). Ricarica la pagina.")
+                st.success("Database ripristinato con successo. Ricarica la pagina.")
     st.divider()
     if st.button("🚪 Esci (Logout)"):
         st.session_state["password_correct"] = False
         st.rerun()
 
-# ---------------------------------------------------------
-# INTERFACCIA PRINCIPALE
-# ---------------------------------------------------------
+# ---------------- INTERFACCIA PRINCIPALE ----------------
 st.title("📊 Gestione & Riconciliazione Verifiche")
 st.markdown("Monitoraggio conversioni in fattura e reportistica temporale per reparto ($T_0 \\to T_1$)")
 
 tabs = st.tabs(["📥 1. Import Programmate (T0)", "🔄 2. Import Consuntivo (T1)", "📊 3. Report & Tempi per Reparto"])
 
-# ---------------------------------------------------------
-# TAB 1: IMPORT PROGRAMMATE (T0)
-# ---------------------------------------------------------
+# ---------------- TAB 1: IMPORT T0 ----------------
 with tabs[0]:
     st.header("1. Caricamento Estrapolazione Programmate (T0)")
     c1, c2 = st.columns([1, 2])
@@ -650,31 +725,17 @@ with tabs[0]:
             n_a = int((df_t0['tipo'] == TIPO_A).sum())
             n_e = int((df_t0['tipo'] == TIPO_E).sum())
             st.success(f"File letto. Verifiche valide: **{len(df_t0)}** (/A: {n_a} | /E: {n_e}) su {info0['righe_file']} righe.")
-            if info0['altro_protocollo']:
-                st.warning(f"{info0['altro_protocollo']} righe con protocollo diverso da /A e /E sono state escluse.")
-            if info0['senza_numero']:
-                st.warning(f"{info0['senza_numero']} righe senza numero verifica sono state scartate.")
-            if info0['senza_data']:
-                st.warning(f"{info0['senza_data']} righe senza una data pianificata valida sono state scartate.")
-            if info0['duplicati']:
-                st.warning(f"{info0['duplicati']} righe con numero verifica duplicato nel file: tenuta l'ultima.")
-            scartate_tot = (info0['altro_protocollo'] + info0['senza_numero'] + info0['senza_data'] + info0['duplicati'])
-            if len(df_t0) + scartate_tot == info0['righe_file']:
-                st.caption(f"✔ Quadratura OK: {len(df_t0)} valide + {scartate_tot} scartate = {info0['righe_file']} righe.")
-            else:
-                st.warning("⚠ Quadratura NON OK tra righe del file e righe valide/scartate.")
-            st.markdown("**Anteprima di cosa verrà salvato:**")
+            
             p1, p2, p3, p4 = st.columns(4)
             p1.metric("Nuove verifiche", piano0['nuove'])
             p2.metric("Già presenti nel database", piano0['presenti'])
             p3.metric("Con data pianificata modificata", piano0['date_cambiate'])
             p4.metric("Prima 'fuori programmazione'", piano0['da_extra'])
-            if piano0['da_extra']:
-                st.caption("Le verifiche indicate nell'ultima colonna erano comparse nel T1 senza essere programmate: "
-                           "ora entrano nel T0 e vengono tolte dal report 'fuori programmazione'.")
+            
             st.dataframe(df_t0.rename(columns={'num': 'Numero verifica', 'protocollo': 'Protocollo',
                                                'tipo': 'Reparto', 'data_pian': 'Data pianificata'})[
                 ['Numero verifica', 'Protocollo', 'Reparto', 'Data pianificata']].head())
+            
             if st.button("💾 Salva Programmazione (T0) nel Database", type="primary", disabled=df_t0.empty):
                 crea_backup("pre-T0")
                 dt0_str = data_caricamento_t0.strftime('%Y-%m-%d')
@@ -682,9 +743,7 @@ with tabs[0]:
                     applica_t0(conn, df_t0, dt0_str)
                 st.success(f"Dati salvati con successo. Data di caricamento originaria ($T_0$): {dt0_str}")
 
-# ---------------------------------------------------------
-# TAB 2: IMPORT CONSUNTIVO (T1) E RICONCILIAZIONE
-# ---------------------------------------------------------
+# ---------------- TAB 2: IMPORT T1 ----------------
 with tabs[1]:
     st.header("2. Riconciliazione Consuntivo / Emissione Fatture (T1)")
     c1, c2 = st.columns([1, 2])
@@ -692,9 +751,9 @@ with tabs[1]:
     file_t1 = st.file_uploader("Trascina il file Excel aggiornato con Fatture", type=["xlsx", "xls"], key="file_t1")
     if file_t1:
         df_raw_t1 = leggi_excel(file_t1)
-        mancanti = [c for c in ['Numero verifica', 'Fattura', 'Data pianificata'] if c not in df_raw_t1.columns]
+        mancanti = [c for c in ['Numero verifica', 'Data pianificata'] if c not in df_raw_t1.columns]
         if mancanti:
-            st.error(f"Il file deve contenere 'Numero verifica', 'Fattura' e 'Data pianificata'. Mancano: {', '.join(mancanti)}.")
+            st.error(f"Il file deve contenere 'Numero verifica' e 'Data pianificata'. Mancano: {', '.join(mancanti)}.")
         else:
             d1, info1 = prepara_t1(df_raw_t1)
             with db_connection() as conn:
@@ -703,78 +762,47 @@ with tabs[1]:
             tot_rilevati = sum(rilevati.values())
             default_reparti = [t for t in (TIPO_A, TIPO_E) if tot_rilevati and rilevati.get(t, 0) / tot_rilevati >= 0.10]
             reparti_coperti = st.multiselect(
-                "Reparti coperti da questo file T1 (le verifiche degli altri reparti non vengono toccate):",
+                "Reparti coperti da questo file T1:",
                 [TIPO_A, TIPO_E], default=default_reparti,
                 key=f"reparti_t1_{file_t1.name}_{file_t1.size}"
             )
-            if rilevati:
-                st.caption("Righe del T1 per reparto: " + " | ".join(f"{t}: {n}" for t, n in rilevati.items()))
-            if not reparti_coperti:
-                st.warning("Nessun reparto selezionato: nessuna verifica verrà segnata come 'Non Più Presente'.")
             piano = pianifica_t1(d1, data_caricamento_t1.date() if isinstance(data_caricamento_t1, datetime) else data_caricamento_t1,
                                  db_stato, reparti_coperti)
-            st.info(f"File consuntivo analizzato. Righe: **{info1['righe_file']}** | Date pianificate coinvolte: **{len(piano['date_t1'])}**")
-            if 'Protocollo' not in df_raw_t1.columns:
-                st.caption("Il file T1 non ha la colonna 'Protocollo': le eventuali verifiche non programmate non potranno essere assegnate a un reparto.")
-            st.markdown("### 🔍 Anteprima riconciliazione (nulla è ancora stato salvato)")
+            
+            st.markdown("### 🔍 Anteprima riconciliazione")
             riepilogo, quadra = riepilogo_piano(piano, info1)
             st.dataframe(riepilogo, hide_index=True)
-            if quadra:
-                st.caption(f"✔ Quadratura OK: {int(riepilogo.iloc[:, 1].sum())} esiti su {info1['righe_file']} righe del file T1.")
-            else:
-                st.warning(f"⚠ Quadratura NON OK: {int(riepilogo.iloc[:, 1].sum())} esiti su {info1['righe_file']} righe del file T1.")
+            
             k1, k2, k3 = st.columns(3)
             k1.metric("Verifiche T0 che diventerebbero 'Non Più Presenti'", len(piano['npp']))
             k2.metric("Su verifiche 'In Attesa' (stesse date e reparti)", piano['base_attesa'])
             k3.metric("Tornerebbero 'In Attesa'", len(piano['riattivate']))
-            if piano['npp']:
-                with st.expander(f"Vedi le {len(piano['npp'])} verifiche che passerebbero a 'Non Più Presente'"):
-                    st.dataframe(db_stato.loc[piano['npp'], ['protocollo', 'tipo_impianto', 'data_pianificata', 'data_t0']]
-                                 .reset_index().rename(columns=RINOMINA), hide_index=True)
-            if piano['extra']:
-                with st.expander(f"Vedi le {len(piano['extra'])} verifiche non programmate nel T0"):
-                    st.dataframe(pd.DataFrame(piano['extra'], columns=['Numero verifica', 'Protocollo', 'Reparto', 'Data pianificata', 'Fattura', 'Data T1']),
-                                 hide_index=True)
+            
             bloccato = False
             if piano['date_incoerenti']:
                 bloccato = True
-                st.error(f"La data del controllo T1 ({piano['dt1_str']}) è precedente alla data di acquisizione T0 di "
-                         f"{len(piano['date_incoerenti'])} verifiche fatturate: i giorni trascorsi risulterebbero negativi. "
-                         f"Correggi la data T1 per poter salvare.")
+                st.error("Presenza di date incoerenti: la data T1 è precedente alla data T0.")
+            
             conferma = True
             if piano['oltre_soglia']:
                 conferma = st.checkbox(
-                    f"⚠ Il {piano['pct_npp']:.0%} delle verifiche 'In Attesa' con queste date risulta assente dal T1 "
-                    f"(soglia di attenzione {SOGLIA_NPP:.0%}). Confermo che il file T1 è completo.",
+                    f"⚠ Il {piano['pct_npp']:.0%} delle verifiche 'In Attesa' con queste date risulta assente dal T1. Confermo che il file è completo.",
                     key="conferma_npp"
                 )
+            
             if st.button("⚡ Esegui Riconciliazione Automatica", type="primary", disabled=(bloccato or not conferma)):
                 crea_backup("pre-T1")
                 with db_connection(commit=True) as conn:
                     applica_t1(conn, piano)
-                st.session_state['esito_t1'] = {
-                    'quando': datetime.now().strftime('%d/%m/%Y %H:%M'),
-                    'dt1': piano['dt1_str'],
-                    'riepilogo': riepilogo,
-                    'npp': len(piano['npp']),
-                    'riattivate': len(piano['riattivate']),
-                }
-                st.success(f"Riconciliazione completata rispetto alla data $T_1 = {piano['dt1_str']}$! "
-                           f"Verifiche T0 passate a 'Non Più Presente': {len(piano['npp'])}.")
-    if 'esito_t1' in st.session_state:
-        e = st.session_state['esito_t1']
-        with st.expander(f"Ultima riconciliazione eseguita ({e['quando']}, T1 = {e['dt1']})"):
-            st.dataframe(e['riepilogo'], hide_index=True)
-            st.write(f"Verifiche T0 passate a 'Non Più Presente': **{e['npp']}** | Tornate 'In Attesa': **{e['riattivate']}**")
+                st.success(f"Riconciliazione completata rispetto alla data $T_1 = {piano['dt1_str']}$!")
 
-# ---------------------------------------------------------
-# TAB 3: REPORT SINTETICO E TEMPORALE PER SEZIONALE
-# ---------------------------------------------------------
+# ---------------- TAB 3: REPORT SINTETICO E GIORNALIERO ----------------
 with tabs[2]:
-    st.header("3. Report Sintetico & Tempi di Conversione per Reparto")
+    st.header("3. Report Sintetico, Tempi di Conversione & Rendicontazione Giornaliera")
     with db_connection() as conn:
         df_db = pd.read_sql_query("SELECT * FROM verifiche", conn)
         df_extra = pd.read_sql_query("SELECT * FROM verifiche_extra", conn)
+    
     if not df_db.empty:
         df_db['data_pianificata_dt'] = pd.to_datetime(df_db['data_pianificata'], errors='coerce')
         valid_dates = df_db['data_pianificata_dt'].dropna()
@@ -784,14 +812,15 @@ with tabs[2]:
         else:
             min_date = datetime.today().date()
             max_date = datetime.today().date()
-        st.markdown("### 📅 Filtro Periodo Pianificazione (Globale)")
+            
+        st.markdown("### 📅 Filtro Periodo Pianificazione")
         c1, c2 = st.columns([1, 2])
         filtro_tipo = c1.radio("Scegli l'ampiezza dell'analisi:", ["Tutto il database", "Seleziona Range Personalizzato"])
         df_extra_filtrato = df_extra.copy()
+        
         if filtro_tipo == "Tutto il database":
             df_filtrato = df_db.copy()
             descr_periodo = f"{min_date.strftime('%d/%m/%Y')} - {max_date.strftime('%d/%m/%Y')} (intero storico)"
-            st.info(f"Stai analizzando l'intero storico: dal **{min_date.strftime('%d/%m/%Y')}** al **{max_date.strftime('%d/%m/%Y')}**")
         else:
             date_range = c2.date_input(
                 "Seleziona la data di Inizio e Fine:",
@@ -807,92 +836,52 @@ with tabs[2]:
                     extra_dt = pd.to_datetime(df_extra['data_pianificata'], errors='coerce').dt.date
                     df_extra_filtrato = df_extra.loc[(extra_dt >= start_date) & (extra_dt <= end_date)]
                 descr_periodo = f"{start_date.strftime('%d/%m/%Y')} - {end_date.strftime('%d/%m/%Y')}"
-                st.info(f"Verifiche programmate dal **{start_date.strftime('%d/%m/%Y')}** al **{end_date.strftime('%d/%m/%Y')}**")
             else:
-                st.warning("Seleziona anche la data di fine dal calendario per visualizzare il report.")
+                st.warning("Seleziona anche la data di fine dal calendario.")
                 st.stop()
+                
         st.download_button(
             "📤 Esporta report in Excel",
             data=costruisci_excel(df_filtrato, df_extra_filtrato, descr_periodo),
             file_name=f"report_verifiche_{datetime.now().strftime('%Y%m%d')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
-        st.caption("**Come leggere i tempi.** *Giorni dal T0*: dalla prima acquisizione della verifica nel database fino al controllo T1 in cui "
-                   "compare la fattura (la precisione dipende da quanto spesso carichi il T1). *Giorni da data pianificata*: dalla data pianificata "
-                   "fino allo stesso controllo T1.")
 
+        # 1. RENDICONTAZIONE GIORNALIERA (Nuovo Modulo)
+        mostra_rendicontazione_giornaliera(df_filtrato)
+
+        # 2. REPORT SINTETICO PER REPARTO
         def mostra_report_reparto(df_reparto, titolo_reparto):
             st.markdown("---")
             st.subheader(titolo_reparto)
             m = calcola_metriche(df_reparto)
-            def delta(n):
-                return f"{pct(n, m['tot']):.1f}% del T0"
+            
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("Totale Programmate (T0)", m['tot'])
-            m2.metric("Diventate Fattura", m['fat'], delta(m['fat']), delta_color="off")
-            m3.metric("In Attesa di Fattura", m['att'], delta(m['att']), delta_color="off")
-            m4.metric("Non Più Presenti", m['npp'], delta(m['npp']), delta_color="off")
-            if m['quadra_stati']:
-                st.caption(f"✔ Quadratura OK: {m['fat']} + {m['att']} + {m['npp']} = {m['tot']}")
-            else:
-                st.warning(f"⚠ Quadratura NON OK: {m['fat']} + {m['att']} + {m['npp']} = {m['fat'] + m['att'] + m['npp']} invece di {m['tot']}")
+            m2.metric("Diventate Fattura", m['fat'], f"{pct(m['fat'], m['tot']):.1f}% del T0", delta_color="off")
+            m3.metric("In Attesa di Fattura", m['att'], f"{pct(m['att'], m['tot']):.1f}% del T0", delta_color="off")
+            m4.metric("Non Più Presenti", m['npp'], f"{pct(m['npp'], m['tot']):.1f}% del T0", delta_color="off")
+            
             t1, t2, t3, t4 = st.columns(4)
             for col, f in zip((t1, t2, t3, t4), FASCE):
-                col.metric(ETICHETTE_FASCE[f], m[f],
-                           f"{pct(m[f], m['fat']):.1f}% del fatturato" if m['fat'] else "0%", delta_color="off")
-            if m['quadra_fasce']:
-                st.caption(f"✔ Quadratura fasce OK: {m['somma_fasce']} = {m['fat']} fatturate")
-            else:
-                st.warning(f"⚠ Quadratura fasce NON OK: somma fasce {m['somma_fasce']} invece di {m['fat']} fatturate")
+                col.metric(ETICHETTE_FASCE[f], m[f], f"{pct(m[f], m['fat']):.1f}% del fatturato" if m['fat'] else "0%", delta_color="off")
+                
             s1, s2, s3, s4 = st.columns(4)
             s1.metric("Mediana giorni dal T0", fmt_giorni(m['med_t0']))
             s2.metric("Media giorni dal T0", fmt_giorni(m['media_t0']))
             s3.metric("Mediana giorni da data pianificata", fmt_giorni(m['med_pian']))
             s4.metric("Media giorni da data pianificata", fmt_giorni(m['media_pian']))
-            col_lista = ['numero_verifica', 'protocollo', 'codice_impianto', 'data_pianificata', 'data_t0']
-            with st.expander(f"Elenco verifiche In Attesa ({m['att']})"):
-                st.dataframe(df_reparto[df_reparto['stato'] == 'In Attesa'][col_lista].rename(columns=RINOMINA),
-                             hide_index=True)
-            with st.expander(f"Elenco verifiche Non Più Presenti ({m['npp']})"):
-                st.dataframe(df_reparto[df_reparto['stato'] == 'Non Più Presente'][col_lista].rename(columns=RINOMINA),
-                             hide_index=True)
 
         df_ascensori = df_filtrato[df_filtrato['tipo_impianto'] == TIPO_A]
         mostra_report_reparto(df_ascensori, "🛗 Reparto Ascensori (Sezionale /A)")
+        
         df_messaaterra = df_filtrato[df_filtrato['tipo_impianto'] == TIPO_E]
         mostra_report_reparto(df_messaaterra, "⚡ Reparto Messa a Terra (Sezionale /E)")
 
-        if len(df_ascensori) + len(df_messaaterra) == len(df_filtrato):
-            st.caption(f"✔ Controllo globale OK: {len(df_ascensori)} + {len(df_messaaterra)} = {len(df_filtrato)} verifiche")
-        else:
-            st.warning(f"⚠ Controllo globale NON OK: {len(df_ascensori)} + {len(df_messaaterra)} ≠ {len(df_filtrato)}. "
-                       f"Nel database ci sono verifiche con protocollo diverso da /A e /E.")
-
-        st.markdown("---")
-        st.subheader("🆕 Verifiche presenti nel T1 ma non programmate nel T0")
-        if df_extra_filtrato.empty:
-            st.success("Nessuna verifica fuori programmazione.")
-        else:
-            n_extra = len(df_extra_filtrato)
-            n_extra_fat = int(df_extra_filtrato['fattura'].notna().sum())
-            n_extra_a = int((df_extra_filtrato['tipo_impianto'] == TIPO_A).sum())
-            n_extra_e = int((df_extra_filtrato['tipo_impianto'] == TIPO_E).sum())
-            n_extra_nd = n_extra - n_extra_a - n_extra_e
-            st.warning(f"Rilevate **{n_extra}** verifiche non presenti nelle programmate (T0).")
-            x1, x2, x3, x4 = st.columns(4)
-            x1.metric("Totale fuori programmazione", n_extra)
-            x2.metric("🛗 Ascensori (/A)", n_extra_a)
-            x3.metric("⚡ Messa a Terra (/E)", n_extra_e)
-            x4.metric("Già con fattura", n_extra_fat)
-            if n_extra_nd > 0:
-                st.caption(f"{n_extra_nd} verifiche senza reparto assegnabile (colonna 'Protocollo' assente nel T1).")
-            st.dataframe(
-                df_extra_filtrato[['numero_verifica', 'protocollo', 'tipo_impianto', 'data_pianificata', 'fattura', 'data_t1']]
-                .rename(columns=RINOMINA), hide_index=True
-            )
         st.markdown("---")
         st.subheader("📋 Dettaglio Completo Verifiche Filtrate")
-        df_display = df_filtrato[['numero_verifica', 'data_pianificata', 'tipo_impianto', 'codice_impianto', 'fattura', 'stato',
+        df_display = df_filtrato[['numero_verifica', 'data_pianificata', 'tipo_impianto', 'codice_impianto', 
+                                  'verbale', 'esito_verifica', 'verbale_da_inviare', 'fattura', 'stato',
                                   'data_t0', 'data_t1', 'giorni_trascorsi', 'giorni_da_pianificata', 'fascia_tempo']]
         st.dataframe(df_display.rename(columns=RINOMINA), hide_index=True)
     else:
