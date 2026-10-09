@@ -575,25 +575,18 @@ def costruisci_excel(df_filtrato, df_extra, descrizione_periodo):
     return buf.getvalue()
 
 # =========================================================
-# ==== RENDICONTAZIONE GIORNALIERA ====
+# ==== RENDICONTAZIONE GIORNALIERA DIVERSIFICATA PER REPARTO ====
 # =========================================================
-def mostra_rendicontazione_giornaliera(df):
-    """Calcola e mostra la rendicontazione giornaliera dell'avanzamento dei verbali e delle fatture."""
-    st.markdown("---")
-    st.subheader("📅 Rendicontazione Giornaliera e Avanzamento Verbali")
+def genera_tabella_giornaliera(df_sub):
+    """Calcola l'aggregazione giornaliera per qualsiasi sottoinsieme di dati."""
+    df_a = df_sub.copy()
     
-    if df.empty:
-        st.info("Nessuna verifica trovata per il periodo selezionato.")
-        return
-
-    df_a = df.copy()
-    
-    # Rilevamento stato del verbale e approvazione
+    # Rilevamento stato del verbale e approvazione dell'ingegnere
     df_a['Ha_Verbale'] = df_a['verbale'].notna()
     df_a['Approvato_Ingegnere'] = df_a['verbale_da_inviare'].astype(str).str.upper() == 'SI'
     df_a['Fatturata'] = df_a['fattura'].notna()
     
-    # Classificazione stati
+    # Classificazione delle 4 fasi del processo
     df_a['In_Attesa_Verbale'] = ~df_a['Ha_Verbale']
     df_a['In_Attesa_Ingegnere'] = df_a['Ha_Verbale'] & ~df_a['Fatturata'] & ~df_a['Approvato_Ingegnere']
     df_a['Pronta_da_Fatturare'] = df_a['Ha_Verbale'] & ~df_a['Fatturata'] & df_a['Approvato_Ingegnere']
@@ -611,31 +604,68 @@ def mostra_rendicontazione_giornaliera(df):
         'Data Verifica', 'Totale Eseguite', 'Senza Verbale', 
         'In Attesa Ingegnere', 'Pronte da Fatturare', 'Fatturate'
     ]
+    return giornaliero, df_a
 
-    # Metriche sintetiche complessive
-    tot_eseguite = giornaliero['Totale Eseguite'].sum()
-    tot_fatturate = giornaliero['Fatturate'].sum()
-    tot_pronte = giornaliero['Pronte da Fatturare'].sum()
-    tot_attesa_ing = giornaliero['In Attesa Ingegnere'].sum()
-    tot_senza_verbale = giornaliero['Senza Verbale'].sum()
+def mostra_rendicontazione_giornaliera(df):
+    """Mostra la rendicontazione giornaliera suddivisa tra Totale, Ascensori e Messa a Terra."""
+    st.markdown("---")
+    st.subheader("📅 Rendicontazione Giornaliera e Avanzamento Verbali per Reparto")
+    
+    if df.empty:
+        st.info("Nessuna verifica trovata per il periodo selezionato.")
+        return
 
-    k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("Totale Eseguite", tot_eseguite)
-    k2.metric("Senza Verbale", tot_senza_verbale)
-    k3.metric("In Attesa Ingegnere", tot_attesa_ing)
-    k4.metric("Pronte da Fatturare", tot_pronte)
-    k5.metric("Fatturate", tot_fatturate, f"{(tot_fatturate/tot_eseguite*100 if tot_eseguite else 0):.1f}%")
+    # Creazione delle schede (tabs) per diversificare la vista per Reparto
+    tab_totale, tab_ascensori, tab_messaaterra = st.tabs([
+        "🌐 Totale Generale", 
+        "🛗 Ascensori (Sez. /A)", 
+        "⚡ Messa a Terra (Sez. /E)"
+    ])
 
-    # Tabella e Grafico
-    st.markdown("##### Tabella Dettaglio Giornaliero")
-    st.dataframe(giornaliero, use_container_width=True, hide_index=True)
+    def render_sezione_giornaliera(df_sezione, titolo_sezione):
+        if df_sezione.empty:
+            st.warning(f"Nessuna verifica presente per {titolo_sezione} nel periodo selezionato.")
+            return
 
-    st.markdown("##### Grafico Distribuzione Giornaliera")
-    st.bar_chart(
-        giornaliero.set_index('Data Verifica')[
-            ['Fatturate', 'Pronte da Fatturare', 'In Attesa Ingegnere', 'Senza Verbale']
-        ]
-    )
+        giornaliero, _ = genera_tabella_giornaliera(df_sezione)
+
+        # Indicatori sintetici (KPI)
+        tot_eseguite = giornaliero['Totale Eseguite'].sum()
+        tot_fatturate = giornaliero['Fatturate'].sum()
+        tot_pronte = giornaliero['Pronte da Fatturare'].sum()
+        tot_attesa_ing = giornaliero['In Attesa Ingegnere'].sum()
+        tot_senza_verbale = giornaliero['Senza Verbale'].sum()
+
+        k1, k2, k3, k4, k5 = st.columns(5)
+        k1.metric("Totale Eseguite", tot_eseguite)
+        k2.metric("Senza Verbale", tot_senza_verbale)
+        k3.metric("In Attesa Ingegnere", tot_attesa_ing)
+        k4.metric("Pronte da Fatturare", tot_pronte)
+        k5.metric("Fatturate", tot_fatturate, f"{(tot_fatturate/tot_eseguite*100 if tot_eseguite else 0):.1f}%")
+
+        # Tabella di dettaglio
+        st.markdown(f"##### Detail Giornaliero — {titolo_sezione}")
+        st.dataframe(giornaliero, use_container_width=True, hide_index=True)
+
+        # Grafico a barre
+        st.markdown(f"##### Grafico Distribuzione Giornaliera — {titolo_sezione}")
+        st.bar_chart(
+            giornaliero.set_index('Data Verifica')[
+                ['Fatturate', 'Pronte da Fatturare', 'In Attesa Ingegnere', 'Senza Verbale']
+            ]
+        )
+
+    # Rendering dei singoli sotto-tab
+    with tab_totale:
+        render_sezione_giornaliera(df, "il Totale Generale")
+
+    with tab_ascensori:
+        df_asc = df[df['tipo_impianto'] == TIPO_A]
+        render_sezione_giornaliera(df_asc, "Ascensori (Sezionale /A)")
+
+    with tab_messaaterra:
+        df_mat = df[df['tipo_impianto'] == TIPO_E]
+        render_sezione_giornaliera(df_mat, "Messa a Terra (Sezionale /E)")
 
 # =========================================================
 # ==== INTERFACCIA UTENTE E AUTENTICAZIONE ====
@@ -847,10 +877,10 @@ with tabs[2]:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
-        # 1. RENDICONTAZIONE GIORNALIERA (Nuovo Modulo)
+        # 1. RENDICONTAZIONE GIORNALIERA DIVERSIFICATA PER REPARTO
         mostra_rendicontazione_giornaliera(df_filtrato)
 
-        # 2. REPORT SINTETICO PER REPARTO
+        # 2. REPORT SINTETICO E TEMPI MEDI PER REPARTO
         def mostra_report_reparto(df_reparto, titolo_reparto):
             st.markdown("---")
             st.subheader(titolo_reparto)
