@@ -43,23 +43,12 @@ MAX_BACKUP = 15
 SOGLIA_NPP = 0.20
 TIPO_A = 'Ascensori (DPR 162/99)'
 TIPO_E = 'Messa a Terra (DPR 462/01)'
-FASCE = ["1. Entro 1 Settimana", "2. Entro 2 Settimane", "3. Entro 1 Mese", "4. Oltre 1 Mese"]
-ETICHETTE_FASCE = {
-    FASCE[0]: "≤ 7 Giorni",
-    FASCE[1]: "8 - 14 Giorni",
-    FASCE[2]: "15 - 30 Giorni",
-    FASCE[3]: "> 30 Giorni"
-}
-COLONNE_VERIFICHE_BASE = {
-    'numero_verifica', 'protocollo', 'codice_impianto', 'codice_fiscale', 'data_pianificata',
-    'importo', 'tipo_impianto', 'fattura', 'stato', 'data_t0', 'data_t1'
-}
+
 RINOMINA = {
     'numero_verifica': 'Numero verifica', 'protocollo': 'Protocollo', 'tipo_impianto': 'Reparto',
     'codice_impianto': 'Codice impianto', 'data_pianificata': 'Data pianificata', 'stato': 'Stato',
     'fattura': 'Fattura', 'data_t0': 'Data T0', 'data_t1': 'Data T1',
-    'giorni_trascorsi': 'Giorni dal T0', 'giorni_da_pianificata': 'Giorni da data pianificata',
-    'fascia_tempo': 'Fascia', 'verbale': 'Verbale', 'esito_verifica': 'Esito verifica',
+    'verbale': 'Verbale', 'esito_verifica': 'Esito verifica',
     'verbale_da_inviare': 'Verbale da inviare / Approvato'
 }
 
@@ -103,17 +92,6 @@ def tipo_da_protocollo(protocollo):
         return TIPO_E
     return None
 
-def fascia_da_giorni(giorni):
-    if giorni is None:
-        return "N/D"
-    if giorni <= 7:
-        return FASCE[0]
-    if giorni <= 14:
-        return FASCE[1]
-    if giorni <= 30:
-        return FASCE[2]
-    return FASCE[3]
-
 def leggi_excel(file):
     """Legge l'Excel come testo e pulisce i nomi delle colonne."""
     df = pd.read_excel(file, dtype=str)
@@ -135,7 +113,7 @@ def db_connection(commit=False):
         conn.close()
 
 def init_db():
-    """Inizializza la struttura del database e assicura l'unicità di numero_verifica."""
+    """Inizializza la struttura del database SQLite."""
     with db_connection(commit=True) as conn:
         cursor = conn.cursor()
         cursor.execute('''
@@ -249,7 +227,6 @@ def carica_numeri_extra(conn):
 
 # ---------------- PREPARAZIONE E SALVATAGGIO T0 ----------------
 def prepara_t0(df_raw):
-    """Normalizza le righe di T0 e rimuove eventuali duplicati nello stesso file."""
     d = pd.DataFrame({
         'num': pd.to_numeric(df_raw['Numero verifica'].apply(pulisci_testo), errors='coerce'),
         'protocollo': df_raw['Protocollo'].apply(lambda x: (pulisci_testo(x) or '').upper()),
@@ -330,7 +307,6 @@ def applica_t0(conn, df_t0, dt0_str):
 
 # ---------------- PREPARAZIONE E SALVATAGGIO T1 ----------------
 def prepara_t1(df_raw):
-    """Pulisce il file T1 e rimuove eventuali righe duplicate per il medesimo numero_verifica."""
     d = pd.DataFrame({
         'num': pd.to_numeric(df_raw['Numero verifica'].apply(pulisci_testo), errors='coerce'),
         'fattura': df_raw['Fattura'].apply(pulisci_testo) if 'Fattura' in df_raw.columns else None,
@@ -383,19 +359,11 @@ def _processa_riga_t1(r, db_d, dt1, dt1_str):
             return 'scartata_altro', None
         return 'extra', (num, protocollo, tipo, _txt(r.data_pian), fattura, dt1_str)
 
-    # PROTEZIONE DA RADDOPPIO: se è già fatturata, la lasciamo invariata
     if rec['stato'] == 'Fatturata':
         return 'gia_fatturata', None
 
     if fattura:
-        giorni = giorni_pian = None
-        if rec['data_t0']:
-            giorni = (dt1 - datetime.strptime(rec['data_t0'], '%Y-%m-%d').date()).days
-            if giorni < 0:
-                return 'data_incoerente', num
-        if rec['data_pianificata']:
-            giorni_pian = (dt1 - datetime.strptime(rec['data_pianificata'], '%Y-%m-%d').date()).days
-        return 'fatturata', (fattura, dt1_str, giorni, fascia_da_giorni(giorni), giorni_pian, verbale, esito, v_inviare, num)
+        return 'fatturata', (fattura, dt1_str, 0, 'N/D', 0, verbale, esito, v_inviare, num)
 
     if rec['stato'] == 'Non Più Presente':
         return 'riattivata', (verbale, esito, v_inviare, num)
@@ -440,8 +408,6 @@ def pianifica_t1(d, dt1, db, reparti_coperti):
                 aggiornamenti_verbali.append(payload)
         elif esito == 'scartata_altro':
             scartate_altro += 1
-        elif esito == 'data_incoerente':
-            date_incoerenti.append(payload)
 
     base_attesa, npp = _calcola_npp(db_d, presenti, date_t1, reparti_coperti)
     pct_npp = (len(npp) / base_attesa) if base_attesa else 0.0
@@ -509,156 +475,125 @@ def applica_t1(conn, piano):
     cur.executemany(SQL_UPSERT_EXTRA, piano['extra'])
     logger.info("T1 applicato con successo.")
 
-# ---------------- REPORTISTICA ED ESPORTAZIONE ----------------
-def calcola_metriche(df):
-    fat = df[df['stato'] == 'Fatturata']
-    m = {
-        'tot': len(df),
-        'fat': len(fat),
-        'att': int((df['stato'] == 'In Attesa').sum()),
-        'npp': int((df['stato'] == 'Non Più Presente').sum()),
-    }
-    for f in FASCE:
-        m[f] = int((fat['fascia_tempo'] == f).sum())
-    m['somma_fasce'] = sum(m[f] for f in FASCE)
-    m['quadra_stati'] = (m['fat'] + m['att'] + m['npp'] == m['tot'])
-    m['quadra_fasce'] = (m['somma_fasce'] == m['fat'])
-    m['med_t0'] = fat['giorni_trascorsi'].median() if m['fat'] else float('nan')
-    m['media_t0'] = fat['giorni_trascorsi'].mean() if m['fat'] else float('nan')
-    m['med_pian'] = fat['giorni_da_pianificata'].median() if m['fat'] else float('nan')
-    m['media_pian'] = fat['giorni_da_pianificata'].mean() if m['fat'] else float('nan')
-    return m
+# =========================================================
+# ==== REPORTISTICA RIELABORATA E GIORNALIERA ====
+# =========================================================
 
-def pct(n, base):
-    return (n / base * 100) if base else 0.0
+def genera_report_giornaliero(df_sub):
+    """
+    Calcola l'aggregazione giornaliera focalizzata su:
+    Pianificate (T0), Fatturate, In Attesa (con sotto-fasi verbali) e Non Più Presenti.
+    """
+    df_a = df_sub.copy()
+    
+    # Classificazione degli stati principali
+    df_a['Is_Fatturata'] = df_a['stato'] == 'Fatturata'
+    df_a['Is_InAttesa'] = df_a['stato'] == 'In Attesa'
+    df_a['Is_NPP'] = df_a['stato'] == 'Non Più Presente'
+    
+    # Classificazione delle sotto-fasi dei verbali (solo per le verifiche 'In Attesa')
+    df_a['Ha_Verbale'] = df_a['verbale'].notna()
+    df_a['Approvato'] = df_a['verbale_da_inviare'].astype(str).str.upper() == 'SI'
+    
+    df_a['Senza_Verbale'] = df_a['Is_InAttesa'] & (~df_a['Ha_Verbale'])
+    df_a['In_Attesa_Ingegnere'] = df_a['Is_InAttesa'] & df_a['Ha_Verbale'] & (~df_a['Approvato'])
+    df_a['Pronta_Fattura'] = df_a['Is_InAttesa'] & df_a['Ha_Verbale'] & df_a['Approvato']
 
-def fmt_giorni(x):
-    return "—" if x is None or pd.isna(x) else f"{x:.1f}"
+    # Raggruppamento per data pianificata
+    giornaliero = df_a.groupby('data_pianificata').agg(
+        Pianificate=('numero_verifica', 'count'),
+        Fatturate=('Is_Fatturata', 'sum'),
+        In_Attesa=('Is_InAttesa', 'sum'),
+        Non_Piu_Presenti=('Is_NPP', 'sum'),
+        Senza_Verbale=('Senza_Verbale', 'sum'),
+        In_Attesa_Ingegnere=('In_Attesa_Ingegnere', 'sum'),
+        Pronta_Fattura=('Pronta_Fattura', 'sum')
+    ).reset_index()
+
+    giornaliero['% Fatturato'] = (giornaliero['Fatturate'] / giornaliero['Pianificate'] * 100).round(1)
+
+    giornaliero.columns = [
+        'Data Pianificata', 'Pianificate (T0)', 'Fatturate', 'In Attesa', 'Non Più Presenti',
+        'In Attesa: Senza Verbale', 'In Attesa: Firma Ing.', 'In Attesa: Pronta Fattura', '% Fatturato'
+    ]
+
+    # Riordinamento colonne
+    return giornaliero[[
+        'Data Pianificata', 'Pianificate (T0)', 'Fatturate', '% Fatturato', 'In Attesa',
+        'In Attesa: Senza Verbale', 'In Attesa: Firma Ing.', 'In Attesa: Pronta Fattura', 'Non Più Presenti'
+    ]]
 
 def costruisci_excel(df_filtrato, df_extra, descrizione_periodo):
-    righe = []
-    gruppi = [("Ascensori (/A)", df_filtrato[df_filtrato['tipo_impianto'] == TIPO_A]),
-              ("Messa a Terra (/E)", df_filtrato[df_filtrato['tipo_impianto'] == TIPO_E]),
-              ("Totale", df_filtrato)]
-    for nome, dfr in gruppi:
-        m = calcola_metriche(dfr)
-        righe.append({
-            'Reparto': nome, 'Programmate (T0)': m['tot'],
-            'Fatturate': m['fat'], '% Fatturate': round(pct(m['fat'], m['tot']), 1),
-            'In Attesa': m['att'], '% In Attesa': round(pct(m['att'], m['tot']), 1),
-            'Non Più Presenti': m['npp'], '% Non Più Presenti': round(pct(m['npp'], m['tot']), 1),
-            **{ETICHETTE_FASCE[f]: m[f] for f in FASCE},
-            'Mediana giorni dal T0': None if pd.isna(m['med_t0']) else round(m['med_t0'], 1),
-            'Mediana giorni da data pianificata': None if pd.isna(m['med_pian']) else round(m['med_pian'], 1),
-        })
-    riepilogo = pd.DataFrame(righe)
-    col_det = ['numero_verifica', 'protocollo', 'tipo_impianto', 'codice_impianto', 'data_pianificata', 'stato',
-               'verbale', 'esito_verifica', 'verbale_da_inviare', 'fattura', 'data_t0', 'data_t1', 
-               'giorni_trascorsi', 'giorni_da_pianificata', 'fascia_tempo']
-    col_lista = ['numero_verifica', 'protocollo', 'tipo_impianto', 'codice_impianto', 'data_pianificata', 'verbale', 'esito_verifica', 'verbale_da_inviare', 'data_t0']
-    col_extra = ['numero_verifica', 'protocollo', 'tipo_impianto', 'data_pianificata', 'fattura', 'data_t1']
+    """Genera il file Excel con la nuova struttura focalizzata sui dati giornalieri divisi per reparto."""
     buf = BytesIO()
+    
+    df_asc = df_filtrato[df_filtrato['tipo_impianto'] == TIPO_A]
+    df_mat = df_filtrato[df_filtrato['tipo_impianto'] == TIPO_E]
+    
+    g_tot = genera_report_giornaliero(df_filtrato)
+    g_asc = genera_report_giornaliero(df_asc) if not df_asc.empty else pd.DataFrame()
+    g_mat = genera_report_giornaliero(df_mat) if not df_mat.empty else pd.DataFrame()
+
+    col_det = ['numero_verifica', 'protocollo', 'tipo_impianto', 'codice_impianto', 'data_pianificata', 'stato',
+               'verbale', 'esito_verifica', 'verbale_da_inviare', 'fattura', 'data_t0', 'data_t1']
+
     with pd.ExcelWriter(buf, engine='openpyxl') as writer:
-        pd.DataFrame({'Voce': ['Periodo di pianificazione', 'Generato il'],
-                      'Valore': [descrizione_periodo, datetime.now().strftime('%d/%m/%Y %H:%M')]}
-                     ).to_excel(writer, sheet_name='Info', index=False)
-        riepilogo.to_excel(writer, sheet_name='Riepilogo', index=False)
-        df_filtrato[df_filtrato['stato'] == 'In Attesa'][col_lista].rename(columns=RINOMINA).to_excel(
+        pd.DataFrame({
+            'Voce': ['Periodo di pianificazione', 'Generato il'],
+            'Valore': [descrizione_periodo, datetime.now().strftime('%d/%m/%Y %H:%M')]
+        }).to_excel(writer, sheet_name='Info', index=False)
+        
+        g_tot.to_excel(writer, sheet_name='Riepilogo Totale', index=False)
+        if not g_asc.empty:
+            g_asc.to_excel(writer, sheet_name='Ascensori', index=False)
+        if not g_mat.empty:
+            g_mat.to_excel(writer, sheet_name='Messa a Terra', index=False)
+            
+        df_filtrato[df_filtrato['stato'] == 'In Attesa'][col_det].rename(columns=RINOMINA).to_excel(
             writer, sheet_name='In Attesa', index=False)
-        df_filtrato[df_filtrato['stato'] == 'Non Più Presente'][col_lista].rename(columns=RINOMINA).to_excel(
+        df_filtrato[df_filtrato['stato'] == 'Non Più Presente'][col_det].rename(columns=RINOMINA).to_excel(
             writer, sheet_name='Non Più Presenti', index=False)
-        df_extra[col_extra].rename(columns=RINOMINA).to_excel(writer, sheet_name='Fuori Programmazione', index=False)
-        df_filtrato[col_det].rename(columns=RINOMINA).to_excel(writer, sheet_name='Dettaglio', index=False)
+        df_extra.to_excel(writer, sheet_name='Fuori Programmazione', index=False)
+        df_filtrato[col_det].rename(columns=RINOMINA).to_excel(writer, sheet_name='Dettaglio Completo', index=False)
+        
         for ws in writer.book.worksheets:
             for col in ws.columns:
                 larghezza = max((len(str(c.value)) for c in col if c.value is not None), default=8) + 2
                 ws.column_dimensions[col[0].column_letter].width = min(larghezza, 45)
+                
     return buf.getvalue()
 
-# =========================================================
-# ==== RENDICONTAZIONE GIORNALIERA DIVERSIFICATA PER REPARTO ====
-# =========================================================
-def genera_tabella_giornaliera(df_sub):
-    """Calcola l'aggregazione giornaliera evitando conteggi doppi per il medesimo numero_verifica."""
-    df_a = df_sub.copy()
-    
-    df_a['Ha_Verbale'] = df_a['verbale'].notna()
-    df_a['Approvato_Ingegnere'] = df_a['verbale_da_inviare'].astype(str).str.upper() == 'SI'
-    df_a['Fatturata'] = df_a['fattura'].notna()
-    
-    df_a['In_Attesa_Verbale'] = ~df_a['Ha_Verbale']
-    df_a['In_Attesa_Ingegnere'] = df_a['Ha_Verbale'] & ~df_a['Fatturata'] & ~df_a['Approvato_Ingegnere']
-    df_a['Pronta_da_Fatturare'] = df_a['Ha_Verbale'] & ~df_a['Fatturata'] & df_a['Approvato_Ingegnere']
-
-    giornaliero = df_a.groupby('data_pianificata').agg(
-        Totale_Eseguite=('numero_verifica', 'count'),
-        In_Attesa_Verbale=('In_Attesa_Verbale', 'sum'),
-        In_Attesa_Ingegnere=('In_Attesa_Ingegnere', 'sum'),
-        Pronte_da_Fatturare=('Pronta_da_Fatturare', 'sum'),
-        Fatturate=('Fatturata', 'sum')
-    ).reset_index()
-
-    giornaliero.columns = [
-        'Data Verifica', 'Totale Eseguite', 'Senza Verbale', 
-        'In Attesa Ingegnere', 'Pronte da Fatturare', 'Fatturate'
-    ]
-    return giornaliero, df_a
-
-def mostra_rendicontazione_giornaliera(df):
-    """Mostra la rendicontazione giornaliera suddivisa tra Totale, Ascensori e Messa a Terra."""
-    st.markdown("---")
-    st.subheader("📅 Rendicontazione Giornaliera e Avanzamento Verbali per Reparto")
-    
-    if df.empty:
-        st.info("Nessuna verifica trovata per il periodo selezionato.")
+def mostra_sezione_report_giornaliero(df_sub, nome_titolo):
+    """Visualizza KPI, tabella di dettaglio e grafico a barre per un reparto o per il totale."""
+    if df_sub.empty:
+        st.info(f"Nessuna verifica trovata per {nome_titolo} nel periodo selezionato.")
         return
 
-    tab_totale, tab_ascensori, tab_messaaterra = st.tabs([
-        "🌐 Totale Generale", 
-        "🛗 Ascensori (Sez. /A)", 
-        "⚡ Messa a Terra (Sez. /E)"
-    ])
+    report_df = genera_report_giornaliero(df_sub)
 
-    def render_sezione_giornaliera(df_sezione, titolo_sezione):
-        if df_sezione.empty:
-            st.warning(f"Nessuna verifica presente per {titolo_sezione} nel periodo selezionato.")
-            return
+    tot_pian = report_df['Pianificate (T0)'].sum()
+    tot_fat = report_df['Fatturate'].sum()
+    tot_att = report_df['In Attesa'].sum()
+    tot_npp = report_df['Non Più Presenti'].sum()
+    pct_fat = (tot_fat / tot_pian * 100) if tot_pian else 0.0
 
-        giornaliero, _ = genera_tabella_giornaliera(df_sezione)
+    # 1. Metriche sintetiche (KPI)
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("Pianificate (T0)", tot_pian)
+    k2.metric("Fatturate", tot_fat, f"{pct_fat:.1f}% conv.")
+    k3.metric("In Attesa di Fattura", tot_att)
+    k4.metric("Non Più Presenti", tot_npp)
+    k5.metric("% Conversione", f"{pct_fat:.1f}%")
 
-        tot_eseguite = giornaliero['Totale Eseguite'].sum()
-        tot_fatturate = giornaliero['Fatturate'].sum()
-        tot_pronte = giornaliero['Pronte da Fatturare'].sum()
-        tot_attesa_ing = giornaliero['In Attesa Ingegnere'].sum()
-        tot_senza_verbale = giornaliero['Senza Verbale'].sum()
+    st.markdown(f"##### 📊 Dettaglio Giornaliero — {nome_titolo}")
+    st.dataframe(report_df, use_container_width=True, hide_index=True)
 
-        k1, k2, k3, k4, k5 = st.columns(5)
-        k1.metric("Totale Eseguite", tot_eseguite)
-        k2.metric("Senza Verbale", tot_senza_verbale)
-        k3.metric("In Attesa Ingegnere", tot_attesa_ing)
-        k4.metric("Pronte da Fatturare", tot_pronte)
-        k5.metric("Fatturate", tot_fatturate, f"{(tot_fatturate/tot_eseguite*100 if tot_eseguite else 0):.1f}%")
-
-        st.markdown(f"##### Detail Giornaliero — {titolo_sezione}")
-        st.dataframe(giornaliero, use_container_width=True, hide_index=True)
-
-        st.markdown(f"##### Grafico Distribuzione Giornaliera — {titolo_sezione}")
-        st.bar_chart(
-            giornaliero.set_index('Data Verifica')[
-                ['Fatturate', 'Pronte da Fatturare', 'In Attesa Ingegnere', 'Senza Verbale']
-            ]
-        )
-
-    with tab_totale:
-        render_sezione_giornaliera(df, "il Totale Generale")
-
-    with tab_ascensori:
-        df_asc = df[df['tipo_impianto'] == TIPO_A]
-        render_sezione_giornaliera(df_asc, "Ascensori (Sezionale /A)")
-
-    with tab_messaaterra:
-        df_mat = df[df['tipo_impianto'] == TIPO_E]
-        render_sezione_giornaliera(df_mat, "Messa a Terra (Sezionale /E)")
+    st.markdown(f"##### 📈 Grafico di Conversione Giornaliera — {nome_titolo}")
+    st.bar_chart(
+        report_df.set_index('Data Pianificata')[
+            ['Fatturate', 'In Attesa', 'Non Più Presenti']
+        ]
+    )
 
 # =========================================================
 # ==== INTERFACCIA UTENTE E AUTENTICAZIONE ====
@@ -723,9 +658,9 @@ with st.sidebar:
 
 # ---------------- INTERFACCIA PRINCIPALE ----------------
 st.title("📊 Gestione & Riconciliazione Verifiche")
-st.markdown("Monitoraggio conversioni in fattura e reportistica temporale per reparto ($T_0 \\to T_1$)")
+st.markdown("Monitoraggio quotidiano programmate, fatturate, in attesa e assenti per reparto ($T_0 \\to T_1$)")
 
-tabs = st.tabs(["📥 1. Import Programmate (T0)", "🔄 2. Import Consuntivo (T1)", "📊 3. Report & Tempi per Reparto"])
+tabs = st.tabs(["📥 1. Import Programmate (T0)", "🔄 2. Import Consuntivo (T1)", "📊 3. Report Giornaliero per Reparto"])
 
 # ---------------- TAB 1: IMPORT T0 ----------------
 with tabs[0]:
@@ -802,10 +737,6 @@ with tabs[1]:
             k3.metric("Tornerebbero 'In Attesa'", len(piano['riattivate']))
             
             bloccato = False
-            if piano['date_incoerenti']:
-                bloccato = True
-                st.error("Presenza di date incoerenti: la data T1 è precedente alla data T0.")
-            
             conferma = True
             if piano['oltre_soglia']:
                 conferma = st.checkbox(
@@ -819,9 +750,9 @@ with tabs[1]:
                     applica_t1(conn, piano)
                 st.success(f"Riconciliazione completata rispetto alla data $T_1 = {piano['dt1_str']}$!")
 
-# ---------------- TAB 3: REPORT SINTETICO E GIORNALIERO ----------------
+# ---------------- TAB 3: REPORT GIORNALIERO E RIELABORATO ----------------
 with tabs[2]:
-    st.header("3. Report Sintetico, Tempi di Conversione & Rendicontazione Giornaliera")
+    st.header("3. Rendicontazione Giornaliera e Stato Avanzamento per Reparto")
     with db_connection() as conn:
         df_db = pd.read_sql_query("SELECT * FROM verifiche", conn)
         df_extra = pd.read_sql_query("SELECT * FROM verifiche_extra", conn)
@@ -870,42 +801,31 @@ with tabs[2]:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
-        # 1. RENDICONTAZIONE GIORNALIERA DIVERSIFICATA PER REPARTO
-        mostra_rendicontazione_giornaliera(df_filtrato)
-
-        # 2. REPORT SINTETICO E TEMPI MEDI PER REPARTO
-        def mostra_report_reparto(df_reparto, titolo_reparto):
-            st.markdown("---")
-            st.subheader(titolo_reparto)
-            m = calcola_metriche(df_reparto)
-            
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Totale Programmate (T0)", m['tot'])
-            m2.metric("Diventate Fattura", m['fat'], f"{pct(m['fat'], m['tot']):.1f}% del T0", delta_color="off")
-            m3.metric("In Attesa di Fattura", m['att'], f"{pct(m['att'], m['tot']):.1f}% del T0", delta_color="off")
-            m4.metric("Non Più Presenti", m['npp'], f"{pct(m['npp'], m['tot']):.1f}% del T0", delta_color="off")
-            
-            t1, t2, t3, t4 = st.columns(4)
-            for col, f in zip((t1, t2, t3, t4), FASCE):
-                col.metric(ETICHETTE_FASCE[f], m[f], f"{pct(m[f], m['fat']):.1f}% del fatturato" if m['fat'] else "0%", delta_color="off")
-                
-            s1, s2, s3, s4 = st.columns(4)
-            s1.metric("Mediana giorni dal T0", fmt_giorni(m['med_t0']))
-            s2.metric("Media giorni dal T0", fmt_giorni(m['media_t0']))
-            s3.metric("Mediana giorni da data pianificata", fmt_giorni(m['med_pian']))
-            s4.metric("Media giorni da data pianificata", fmt_giorni(m['media_pian']))
-
-        df_ascensori = df_filtrato[df_filtrato['tipo_impianto'] == TIPO_A]
-        mostra_report_reparto(df_ascensori, "🛗 Reparto Ascensori (Sezionale /A)")
+        st.markdown("---")
         
-        df_messaaterra = df_filtrato[df_filtrato['tipo_impianto'] == TIPO_E]
-        mostra_report_reparto(df_messaaterra, "⚡ Reparto Messa a Terra (Sezionale /E)")
+        # Schede per Reparto
+        tab_asc, tab_mat, tab_tot = st.tabs([
+            "🛗 Ascensori (Sez. /A)", 
+            "⚡ Messa a Terra (Sez. /E)", 
+            "🌐 Totale Complessivo"
+        ])
+
+        with tab_asc:
+            df_asc = df_filtrato[df_filtrato['tipo_impianto'] == TIPO_A]
+            mostra_sezione_report_giornaliero(df_asc, "Reparto Ascensori (Sezionale /A)")
+
+        with tab_mat:
+            df_mat = df_filtrato[df_filtrato['tipo_impianto'] == TIPO_E]
+            mostra_sezione_report_giornaliero(df_mat, "Reparto Messa a Terra (Sezionale /E)")
+
+        with tab_tot:
+            mostra_sezione_report_giornaliero(df_filtrato, "Totale Aziendale Complessivo")
 
         st.markdown("---")
         st.subheader("📋 Dettaglio Completo Verifiche Filtrate")
         df_display = df_filtrato[['numero_verifica', 'data_pianificata', 'tipo_impianto', 'codice_impianto', 
                                   'verbale', 'esito_verifica', 'verbale_da_inviare', 'fattura', 'stato',
-                                  'data_t0', 'data_t1', 'giorni_trascorsi', 'giorni_da_pianificata', 'fascia_tempo']]
+                                  'data_t0', 'data_t1']]
         st.dataframe(df_display.rename(columns=RINOMINA), hide_index=True)
     else:
         st.info("Nessun dato salvato nel sistema. Effettua un primo caricamento nel Tab 1.")
