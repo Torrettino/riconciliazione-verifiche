@@ -6,7 +6,7 @@ import re
 import tempfile
 import logging
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, date
 from io import BytesIO
 
 # ---------------------------------------------------------
@@ -14,7 +14,6 @@ from io import BytesIO
 # ---------------------------------------------------------
 st.set_page_config(page_title="Riconciliazione Verifiche Impianti", page_icon="📊", layout="wide")
 
-# Password letta prioritariamente da variabile d'ambiente, altrimenti da st.secrets.
 PASSWORD_ACCESSO = os.environ.get("VERIFICHE_PASSWORD")
 if not PASSWORD_ACCESSO:
     try:
@@ -26,7 +25,6 @@ if not PASSWORD_ACCESSO:
     st.error("Configurazione di sicurezza incompleta: variabile d'ambiente VERIFICHE_PASSWORD o st.secrets['password'] assente.")
     st.stop()
 
-# Logging strutturato di base
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -57,7 +55,6 @@ RINOMINA = {
 # =========================================================
 
 def pulisci_testo(v):
-    """Normalizza un valore di cella: None se vuoto/NaN, testo pulito altrimenti."""
     if v is None:
         return None
     try:
@@ -73,7 +70,6 @@ def pulisci_testo(v):
     return s
 
 def _parse_una_data(v):
-    """Restituisce 'YYYY-MM-DD' oppure None."""
     t = pulisci_testo(v)
     if t is None:
         return None
@@ -84,7 +80,6 @@ def _parse_una_data(v):
     return None if pd.isna(dt) else dt.strftime('%Y-%m-%d')
 
 def tipo_da_protocollo(protocollo):
-    """Identifica il reparto dal sezionale (/A per Ascensori, /E per Messa a Terra)."""
     p = (pulisci_testo(protocollo) or '').upper()
     if p.endswith('/A'):
         return TIPO_A
@@ -93,14 +88,12 @@ def tipo_da_protocollo(protocollo):
     return None
 
 def leggi_excel(file):
-    """Legge l'Excel come testo e pulisce i nomi delle colonne."""
     df = pd.read_excel(file, dtype=str)
     df.columns = [str(c).strip() for c in df.columns]
     return df
 
 @contextmanager
 def db_connection(commit=False):
-    """Gestisce l'apertura e la chiusura della connessione al database SQLite."""
     conn = sqlite3.connect(DB_NAME)
     try:
         yield conn
@@ -113,7 +106,6 @@ def db_connection(commit=False):
         conn.close()
 
 def init_db():
-    """Inizializza la struttura del database SQLite."""
     with db_connection(commit=True) as conn:
         cursor = conn.cursor()
         cursor.execute('''
@@ -158,7 +150,6 @@ def init_db():
         ''')
 
 def crea_backup(motivo="auto"):
-    """Crea una copia di sicurezza (.db) prima di apportare modifiche."""
     if not os.path.exists(DB_NAME):
         return None
     os.makedirs(BACKUP_DIR, exist_ok=True)
@@ -190,7 +181,6 @@ def ultimo_backup():
     return datetime.fromtimestamp(ts)
 
 def valida_db_caricato(raw):
-    """Verifica l'integrità di un file database caricato."""
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
     try:
         tmp.write(raw)
@@ -479,19 +469,28 @@ def applica_t1(conn, piano):
 # ==== REPORTISTICA RIELABORATA E GIORNALIERA ====
 # =========================================================
 
+def filtra_per_intervallo_date(df, start_date, end_date):
+    """Filtra il DataFrame garantendo la corretta conversione delle date sia ISO che italiane."""
+    df_temp = df.copy()
+    s_dt = pd.to_datetime(df_temp['data_pianificata'], errors='coerce', format='%Y-%m-%d')
+    mask_missing = s_dt.isna()
+    if mask_missing.any():
+        s_dt[mask_missing] = pd.to_datetime(
+            df_temp.loc[mask_missing, 'data_pianificata'], 
+            errors='coerce', 
+            dayfirst=True
+        )
+    df_temp['dt_clean'] = s_dt.dt.date
+    mask = (df_temp['dt_clean'] >= start_date) & (df_temp['dt_clean'] <= end_date)
+    return df_temp.loc[mask].drop(columns=['dt_clean'])
+
 def genera_report_giornaliero(df_sub):
-    """
-    Calcola l'aggregazione giornaliera focalizzata su:
-    Pianificate (T0), Fatturate, In Attesa (con sotto-fasi verbali) e Non Più Presenti.
-    """
     df_a = df_sub.copy()
     
-    # Classificazione degli stati principali
     df_a['Is_Fatturata'] = df_a['stato'] == 'Fatturata'
     df_a['Is_InAttesa'] = df_a['stato'] == 'In Attesa'
     df_a['Is_NPP'] = df_a['stato'] == 'Non Più Presente'
     
-    # Classificazione delle sotto-fasi dei verbali (solo per le verifiche 'In Attesa')
     df_a['Ha_Verbale'] = df_a['verbale'].notna()
     df_a['Approvato'] = df_a['verbale_da_inviare'].astype(str).str.upper() == 'SI'
     
@@ -499,7 +498,6 @@ def genera_report_giornaliero(df_sub):
     df_a['In_Attesa_Ingegnere'] = df_a['Is_InAttesa'] & df_a['Ha_Verbale'] & (~df_a['Approvato'])
     df_a['Pronta_Fattura'] = df_a['Is_InAttesa'] & df_a['Ha_Verbale'] & df_a['Approvato']
 
-    # Raggruppamento per data pianificata
     giornaliero = df_a.groupby('data_pianificata').agg(
         Pianificate=('numero_verifica', 'count'),
         Fatturate=('Is_Fatturata', 'sum'),
@@ -517,20 +515,18 @@ def genera_report_giornaliero(df_sub):
         'In Attesa: Senza Verbale', 'In Attesa: Firma Ing.', 'In Attesa: Pronta Fattura', '% Fatturato'
     ]
 
-    # Riordinamento colonne
     return giornaliero[[
         'Data Pianificata', 'Pianificate (T0)', 'Fatturate', '% Fatturato', 'In Attesa',
         'In Attesa: Senza Verbale', 'In Attesa: Firma Ing.', 'In Attesa: Pronta Fattura', 'Non Più Presenti'
     ]]
 
 def costruisci_excel(df_filtrato, df_extra, descrizione_periodo):
-    """Genera il file Excel con la nuova struttura focalizzata sui dati giornalieri divisi per reparto."""
     buf = BytesIO()
     
     df_asc = df_filtrato[df_filtrato['tipo_impianto'] == TIPO_A]
     df_mat = df_filtrato[df_filtrato['tipo_impianto'] == TIPO_E]
     
-    g_tot = genera_report_giornaliero(df_filtrato)
+    g_tot = genera_report_giornaliero(df_filtrato) if not df_filtrato.empty else pd.DataFrame()
     g_asc = genera_report_giornaliero(df_asc) if not df_asc.empty else pd.DataFrame()
     g_mat = genera_report_giornaliero(df_mat) if not df_mat.empty else pd.DataFrame()
 
@@ -543,7 +539,8 @@ def costruisci_excel(df_filtrato, df_extra, descrizione_periodo):
             'Valore': [descrizione_periodo, datetime.now().strftime('%d/%m/%Y %H:%M')]
         }).to_excel(writer, sheet_name='Info', index=False)
         
-        g_tot.to_excel(writer, sheet_name='Riepilogo Totale', index=False)
+        if not g_tot.empty:
+            g_tot.to_excel(writer, sheet_name='Riepilogo Totale', index=False)
         if not g_asc.empty:
             g_asc.to_excel(writer, sheet_name='Ascensori', index=False)
         if not g_mat.empty:
@@ -564,7 +561,6 @@ def costruisci_excel(df_filtrato, df_extra, descrizione_periodo):
     return buf.getvalue()
 
 def mostra_sezione_report_giornaliero(df_sub, nome_titolo):
-    """Visualizza KPI, tabella di dettaglio e grafico a barre per un reparto o per il totale."""
     if df_sub.empty:
         st.info(f"Nessuna verifica trovata per {nome_titolo} nel periodo selezionato.")
         return
@@ -577,7 +573,6 @@ def mostra_sezione_report_giornaliero(df_sub, nome_titolo):
     tot_npp = report_df['Non Più Presenti'].sum()
     pct_fat = (tot_fat / tot_pian * 100) if tot_pian else 0.0
 
-    # 1. Metriche sintetiche (KPI)
     k1, k2, k3, k4, k5 = st.columns(5)
     k1.metric("Pianificate (T0)", tot_pian)
     k2.metric("Fatturate", tot_fat, f"{pct_fat:.1f}% conv.")
@@ -758,41 +753,45 @@ with tabs[2]:
         df_extra = pd.read_sql_query("SELECT * FROM verifiche_extra", conn)
     
     if not df_db.empty:
-        df_db['data_pianificata_dt'] = pd.to_datetime(df_db['data_pianificata'], errors='coerce')
-        valid_dates = df_db['data_pianificata_dt'].dropna()
+        # Pulisce le date trovando la minima e la massima del database
+        s_dates = pd.to_datetime(df_db['data_pianificata'], errors='coerce')
+        valid_dates = s_dates.dropna()
+        
         if not valid_dates.empty:
             min_date = valid_dates.min().date()
             max_date = valid_dates.max().date()
         else:
-            min_date = datetime.today().date()
-            max_date = datetime.today().date()
+            min_date = date.today()
+            max_date = date.today()
             
         st.markdown("### 📅 Filtro Periodo Pianificazione")
         c1, c2 = st.columns([1, 2])
         filtro_tipo = c1.radio("Scegli l'ampiezza dell'analisi:", ["Tutto il database", "Seleziona Range Personalizzato"])
-        df_extra_filtrato = df_extra.copy()
         
-        if filtro_tipo == "Tutto il database":
-            df_filtrato = df_db.copy()
-            descr_periodo = f"{min_date.strftime('%d/%m/%Y')} - {max_date.strftime('%d/%m/%Y')} (intero storico)"
-        else:
+        df_filtrato = df_db.copy()
+        df_extra_filtrato = df_extra.copy()
+        descr_periodo = f"{min_date.strftime('%d/%m/%Y')} - {max_date.strftime('%d/%m/%Y')} (intero storico)"
+        
+        if filtro_tipo == "Seleziona Range Personalizzato":
             date_range = c2.date_input(
                 "Seleziona la data di Inizio e Fine:",
                 value=(min_date, max_date),
                 min_value=min_date,
                 max_value=max_date
             )
-            if isinstance(date_range, tuple) and len(date_range) == 2:
-                start_date, end_date = date_range
-                mask = (df_db['data_pianificata_dt'].dt.date >= start_date) & (df_db['data_pianificata_dt'].dt.date <= end_date)
-                df_filtrato = df_db.loc[mask]
-                if not df_extra.empty:
-                    extra_dt = pd.to_datetime(df_extra['data_pianificata'], errors='coerce').dt.date
-                    df_extra_filtrato = df_extra.loc[(extra_dt >= start_date) & (extra_dt <= end_date)]
-                descr_periodo = f"{start_date.strftime('%d/%m/%Y')} - {end_date.strftime('%d/%m/%Y')}"
-            else:
-                st.warning("Seleziona anche la data di fine dal calendario.")
-                st.stop()
+            
+            # Gestisce sia quando l'utente ha selezionato entrambe le date, sia il primo clic
+            if isinstance(date_range, (tuple, list)):
+                if len(date_range) == 2:
+                    start_date, end_date = date_range
+                    df_filtrato = filtra_per_intervallo_date(df_db, start_date, end_date)
+                    if not df_extra.empty and 'data_pianificata' in df_extra.columns:
+                        df_extra_filtrato = filtra_per_intervallo_date(df_extra, start_date, end_date)
+                    descr_periodo = f"{start_date.strftime('%d/%m/%Y')} - {end_date.strftime('%d/%m/%Y')}"
+                elif len(date_range) == 1:
+                    start_date = date_range[0]
+                    df_filtrato = filtra_per_intervallo_date(df_db, start_date, max_date)
+                    st.caption("ℹ️ Seleziona anche la data di fine dal calendario per completare l'intervallo.")
                 
         st.download_button(
             "📤 Esporta report in Excel",
@@ -803,7 +802,7 @@ with tabs[2]:
 
         st.markdown("---")
         
-        # Schede per Reparto
+        # Schede dinamiche
         tab_asc, tab_mat, tab_tot = st.tabs([
             "🛗 Ascensori (Sez. /A)", 
             "⚡ Messa a Terra (Sez. /E)", 
