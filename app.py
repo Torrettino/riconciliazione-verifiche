@@ -135,7 +135,7 @@ def db_connection(commit=False):
         conn.close()
 
 def init_db():
-    """Inizializza la struttura del database e aggiunge eventuali nuove colonne mancanti."""
+    """Inizializza la struttura del database e assicura l'unicità di numero_verifica."""
     with db_connection(commit=True) as conn:
         cursor = conn.cursor()
         cursor.execute('''
@@ -156,7 +156,6 @@ def init_db():
         cursor.execute("PRAGMA table_info(verifiche)")
         colonne = [c[1] for c in cursor.fetchall()]
         
-        # Aggiornamento dello schema con colonne per calcoli temporali e verbali
         nuove_colonne = {
             'giorni_trascorsi': 'INTEGER',
             'fascia_tempo': 'TEXT',
@@ -250,7 +249,7 @@ def carica_numeri_extra(conn):
 
 # ---------------- PREPARAZIONE E SALVATAGGIO T0 ----------------
 def prepara_t0(df_raw):
-    """Normalizza e pulisce le righe dell'Excel delle programmate (T0)."""
+    """Normalizza le righe di T0 e rimuove eventuali duplicati nello stesso file."""
     d = pd.DataFrame({
         'num': pd.to_numeric(df_raw['Numero verifica'].apply(pulisci_testo), errors='coerce'),
         'protocollo': df_raw['Protocollo'].apply(lambda x: (pulisci_testo(x) or '').upper()),
@@ -331,6 +330,7 @@ def applica_t0(conn, df_t0, dt0_str):
 
 # ---------------- PREPARAZIONE E SALVATAGGIO T1 ----------------
 def prepara_t1(df_raw):
+    """Pulisce il file T1 e rimuove eventuali righe duplicate per il medesimo numero_verifica."""
     d = pd.DataFrame({
         'num': pd.to_numeric(df_raw['Numero verifica'].apply(pulisci_testo), errors='coerce'),
         'fattura': df_raw['Fattura'].apply(pulisci_testo) if 'Fattura' in df_raw.columns else None,
@@ -383,6 +383,7 @@ def _processa_riga_t1(r, db_d, dt1, dt1_str):
             return 'scartata_altro', None
         return 'extra', (num, protocollo, tipo, _txt(r.data_pian), fattura, dt1_str)
 
+    # PROTEZIONE DA RADDOPPIO: se è già fatturata, la lasciamo invariata
     if rec['stato'] == 'Fatturata':
         return 'gia_fatturata', None
 
@@ -466,16 +467,16 @@ def pianifica_t1(d, dt1, db, reparti_coperti):
 
 def riepilogo_piano(piano, info1):
     righe = [
-        ("Nuove fatture rilevate", len(piano['fatturate'])),
-        ("Già fatturate in precedenza (invariate)", piano['gia_fatturate']),
+        ("Nuove fatture rilevate (verranno registrate)", len(piano['fatturate'])),
+        ("Già fatturate in precedenza (ignorate per evitare raddoppi)", piano['gia_fatturate']),
         ("Presenti nel T1 ma ancora senza fattura", piano['senza_fattura']),
         ("Non programmate nel T0 (report a parte)", len(piano['extra'])),
         ("Escluse (protocollo diverso da /A e /E)", piano['scartate_altro']),
         ("Righe senza numero verifica (scartate)", info1['senza_numero']),
-        ("Righe duplicate (scartate)", info1['duplicati']),
+        ("Righe duplicate nel file Excel (scartate)", info1['duplicati']),
     ]
-    df = pd.DataFrame(righe, columns=["Esito", "Righe del file T1"])
-    quadra = int(df["Righe del file T1"].sum()) == info1['righe_file']
+    df = pd.DataFrame(righe, columns=["Esito Riconciliazione", "Conteggio Righe"])
+    quadra = int(df["Conteggio Righe"].sum()) == info1['righe_file']
     return df, quadra
 
 SQL_UPSERT_EXTRA = '''
@@ -578,20 +579,17 @@ def costruisci_excel(df_filtrato, df_extra, descrizione_periodo):
 # ==== RENDICONTAZIONE GIORNALIERA DIVERSIFICATA PER REPARTO ====
 # =========================================================
 def genera_tabella_giornaliera(df_sub):
-    """Calcola l'aggregazione giornaliera per qualsiasi sottoinsieme di dati."""
+    """Calcola l'aggregazione giornaliera evitando conteggi doppi per il medesimo numero_verifica."""
     df_a = df_sub.copy()
     
-    # Rilevamento stato del verbale e approvazione dell'ingegnere
     df_a['Ha_Verbale'] = df_a['verbale'].notna()
     df_a['Approvato_Ingegnere'] = df_a['verbale_da_inviare'].astype(str).str.upper() == 'SI'
     df_a['Fatturata'] = df_a['fattura'].notna()
     
-    # Classificazione delle 4 fasi del processo
     df_a['In_Attesa_Verbale'] = ~df_a['Ha_Verbale']
     df_a['In_Attesa_Ingegnere'] = df_a['Ha_Verbale'] & ~df_a['Fatturata'] & ~df_a['Approvato_Ingegnere']
     df_a['Pronta_da_Fatturare'] = df_a['Ha_Verbale'] & ~df_a['Fatturata'] & df_a['Approvato_Ingegnere']
 
-    # Raggruppamento per data pianificata
     giornaliero = df_a.groupby('data_pianificata').agg(
         Totale_Eseguite=('numero_verifica', 'count'),
         In_Attesa_Verbale=('In_Attesa_Verbale', 'sum'),
@@ -615,7 +613,6 @@ def mostra_rendicontazione_giornaliera(df):
         st.info("Nessuna verifica trovata per il periodo selezionato.")
         return
 
-    # Creazione delle schede (tabs) per diversificare la vista per Reparto
     tab_totale, tab_ascensori, tab_messaaterra = st.tabs([
         "🌐 Totale Generale", 
         "🛗 Ascensori (Sez. /A)", 
@@ -629,7 +626,6 @@ def mostra_rendicontazione_giornaliera(df):
 
         giornaliero, _ = genera_tabella_giornaliera(df_sezione)
 
-        # Indicatori sintetici (KPI)
         tot_eseguite = giornaliero['Totale Eseguite'].sum()
         tot_fatturate = giornaliero['Fatturate'].sum()
         tot_pronte = giornaliero['Pronte da Fatturare'].sum()
@@ -643,11 +639,9 @@ def mostra_rendicontazione_giornaliera(df):
         k4.metric("Pronte da Fatturare", tot_pronte)
         k5.metric("Fatturate", tot_fatturate, f"{(tot_fatturate/tot_eseguite*100 if tot_eseguite else 0):.1f}%")
 
-        # Tabella di dettaglio
         st.markdown(f"##### Detail Giornaliero — {titolo_sezione}")
         st.dataframe(giornaliero, use_container_width=True, hide_index=True)
 
-        # Grafico a barre
         st.markdown(f"##### Grafico Distribuzione Giornaliera — {titolo_sezione}")
         st.bar_chart(
             giornaliero.set_index('Data Verifica')[
@@ -655,7 +649,6 @@ def mostra_rendicontazione_giornaliera(df):
             ]
         )
 
-    # Rendering dei singoli sotto-tab
     with tab_totale:
         render_sezione_giornaliera(df, "il Totale Generale")
 
