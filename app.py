@@ -14,8 +14,15 @@ from io import BytesIO
 # ---------------------------------------------------------
 st.set_page_config(page_title="Riconciliazione Verifiche Impianti", page_icon="📊", layout="wide")
 
-# Password letta da variabile d'ambiente o da st.secrets. Nessuna password in chiaro nel codice.
-PASSWORD_ACCESSO = os.environ.get("VERIFICHE_PASSWORD") or st.secrets.get("password", None)
+# Password letta prioritariamente da variabile d'ambiente, altrimenti da st.secrets.
+# Accesso reso robusto per evitare fallimenti silenziosi.
+PASSWORD_ACCESSO = os.environ.get("VERIFICHE_PASSWORD")
+if not PASSWORD_ACCESSO:
+    try:
+        PASSWORD_ACCESSO = st.secrets["password"]
+    except Exception:
+        PASSWORD_ACCESSO = None
+
 if not PASSWORD_ACCESSO:
     st.error("Configurazione di sicurezza incompleta: variabile d'ambiente VERIFICHE_PASSWORD o st.secrets['password'] assente.")
     st.stop()
