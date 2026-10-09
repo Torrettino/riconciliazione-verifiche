@@ -113,9 +113,9 @@ with st.sidebar:
 # INTERFACCIA PRINCIPALE
 # ---------------------------------------------------------
 st.title("📊 Gestione & Riconciliazione Verifiche")
-st.markdown("Monitoraggio conversioni in fattura e reportistica temporale ($T_0 \\to T_1$)")
+st.markdown("Monitoraggio conversioni in fattura e reportistica temporale per reparto ($T_0 \\to T_1$)")
 
-tabs = st.tabs(["📥 1. Import Programmate (T0)", "🔄 2. Import Consuntivo (T1)", "📊 3. Report & Tempi"])
+tabs = st.tabs(["📥 1. Import Programmate (T0)", "🔄 2. Import Consuntivo (T1)", "📊 3. Report & Tempi per Reparto"])
 
 # ---------------------------------------------------------
 # TAB 1: IMPORT PROGRAMMATE (T0)
@@ -246,16 +246,15 @@ with tabs[1]:
             st.error("Il file deve contenere 'Numero verifica', 'Fattura' e 'Data pianificata'.")
 
 # ---------------------------------------------------------
-# TAB 3: REPORT SINTETICO E TEMPORALE CON CALENDARIO
+# TAB 3: REPORT SINTETICO E TEMPORALE PER SEZIONALE
 # ---------------------------------------------------------
 with tabs[2]:
-    st.header("3. Report Sintetico & Tempi di Conversione")
+    st.header("3. Report Sintetico & Tempi di Conversione per Reparto")
     conn = get_db_connection()
     df_db = pd.read_sql_query("SELECT * FROM verifiche", conn)
     conn.close()
     
     if not df_db.empty:
-        # Prepara le date per il calendario
         df_db['data_pianificata_dt'] = pd.to_datetime(df_db['data_pianificata'], errors='coerce')
         valid_dates = df_db['data_pianificata_dt'].dropna()
         
@@ -266,7 +265,7 @@ with tabs[2]:
             min_date = datetime.today().date()
             max_date = datetime.today().date()
             
-        st.markdown("### 📅 Filtro Periodo Pianificazione")
+        st.markdown("### 📅 Filtro Periodo Pianificazione (Globale)")
         c1, c2 = st.columns([1, 2])
         
         filtro_tipo = c1.radio("Scegli l'ampiezza dell'analisi:", ["Tutto il database", "Seleziona Range Personalizzato"])
@@ -275,7 +274,6 @@ with tabs[2]:
             df_filtrato = df_db.copy()
             st.info(f"Stai analizzando l'intero storico: dal **{min_date.strftime('%d/%m/%Y')}** al **{max_date.strftime('%d/%m/%Y')}**")
         else:
-            # Selezione Range Calendario
             date_range = c2.date_input(
                 "Seleziona la data di Inizio e Fine:",
                 value=(min_date, max_date),
@@ -292,38 +290,45 @@ with tabs[2]:
                 st.warning("Seleziona anche la data di fine dal calendario per visualizzare il report.")
                 st.stop()
                 
-        tot_prog = len(df_filtrato)
-        tot_fat = len(df_filtrato[df_filtrato['stato'] == 'Fatturata'])
-        tot_att = len(df_filtrato[df_filtrato['stato'] == 'In Attesa'])
-        tot_non_pres = len(df_filtrato[df_filtrato['stato'] == 'Non Più Presente'])
-        perc_conv = (tot_fat / tot_prog * 100) if tot_prog > 0 else 0.0
-        
-        st.subheader("1. Riepilogo Volumi")
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Totale Programmate", tot_prog)
-        m2.metric("Diventate Fattura", tot_fat, f"{perc_conv:.1f}% di conversione")
-        m3.metric("In Attesa di Fattura", tot_att)
-        m4.metric("Non Più Presenti", tot_non_pres)
-        
-        st.divider()
-        
-        st.subheader(f"2. Età di Fatturazione (Dal caricamento $T_0$ al consuntivo $T_1$)")
-        df_fatturate = df_filtrato[df_filtrato['stato'] == 'Fatturata']
-        
-        t1, t2, t3, t4 = st.columns(4)
-        e_1_sett = len(df_fatturate[df_fatturate['fascia_tempo'] == '1. Entro 1 Settimana'])
-        e_2_sett = len(df_fatturate[df_fatturate['fascia_tempo'] == '2. Entro 2 Settimane'])
-        e_1_mese = len(df_fatturate[df_fatturate['fascia_tempo'] == '3. Entro 1 Mese'])
-        oltre_mese = len(df_fatturate[df_fatturate['fascia_tempo'] == '4. Oltre 1 Mese'])
-        
-        t1.metric("≤ 7 Giorni", e_1_sett, f"{(e_1_sett/tot_fat*100):.1f}% del fatturato" if tot_fat>0 else "0%")
-        t2.metric("8 - 14 Giorni", e_2_sett, f"{(e_2_sett/tot_fat*100):.1f}% del fatturato" if tot_fat>0 else "0%")
-        t3.metric("15 - 30 Giorni", e_1_mese, f"{(e_1_mese/tot_fat*100):.1f}% del fatturato" if tot_fat>0 else "0%")
-        t4.metric("> 30 Giorni", oltre_mese, f"{(oltre_mese/tot_fat*100):.1f}% del fatturato" if tot_fat>0 else "0%")
-        
-        st.divider()
-        
-        st.subheader("Dettaglio Verifiche Filtrate")
+        # Funzione di supporto per mostrare le metriche di un singolo reparto
+        def mostra_report_reparto(df_reparto, titolo_reparto):
+            st.markdown(f"---")
+            st.subheader(titolo_reparto)
+            
+            tot_prog = len(df_reparto)
+            tot_fat = len(df_reparto[df_reparto['stato'] == 'Fatturata'])
+            tot_att = len(df_reparto[df_reparto['stato'] == 'In Attesa'])
+            tot_non_pres = len(df_reparto[df_reparto['stato'] == 'Non Più Presente'])
+            perc_conv = (tot_fat / tot_prog * 100) if tot_prog > 0 else 0.0
+            
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Totale Programmate", tot_prog)
+            m2.metric("Diventate Fattura", tot_fat, f"{perc_conv:.1f}% di conversione")
+            m3.metric("In Attesa di Fattura", tot_att)
+            m4.metric("Non Più Presenti", tot_non_pres)
+            
+            df_fatturate = df_reparto[df_reparto['stato'] == 'Fatturata']
+            t1, t2, t3, t4 = st.columns(4)
+            e_1_sett = len(df_fatturate[df_fatturate['fascia_tempo'] == '1. Entro 1 Settimana'])
+            e_2_sett = len(df_fatturate[df_fatturate['fascia_tempo'] == '2. Entro 2 Settimane'])
+            e_1_mese = len(df_fatturate[df_fatturate['fascia_tempo'] == '3. Entro 1 Mese'])
+            oltre_mese = len(df_fatturate[df_fatturate['fascia_tempo'] == '4. Oltre 1 Mese'])
+            
+            t1.metric("≤ 7 Giorni", e_1_sett, f"{(e_1_sett/tot_fat*100):.1f}% del fatturato" if tot_fat>0 else "0%")
+            t2.metric("8 - 14 Giorni", e_2_sett, f"{(e_2_sett/tot_fat*100):.1f}% del fatturato" if tot_fat>0 else "0%")
+            t3.metric("15 - 30 Giorni", e_1_mese, f"{(e_1_mese/tot_fat*100):.1f}% del fatturato" if tot_fat>0 else "0%")
+            t4.metric("> 30 Giorni", oltre_mese, f"{(oltre_mese/tot_fat*100):.1f}% del fatturato" if tot_fat>0 else "0%")
+
+        # 1. Reparto Ascensori (/A)
+        df_ascensori = df_filtrato[df_filtrato['tipo_impianto'] == 'Ascensori (DPR 162/99)']
+        mostra_report_reparto(df_ascensori, "🛗 Reparto Ascensori (Sezionale /A)")
+
+        # 2. Reparto Messa a Terra (/E)
+        df_messaaterra = df_filtrato[df_filtrato['tipo_impianto'] == 'Messa a Terra (DPR 462/01)']
+        mostra_report_reparto(df_messaaterra, "⚡ Reparto Messa a Terra (Sezionale /E)")
+
+        st.markdown("---")
+        st.subheader("📋 Dettaglio Completo Verifiche Filtrate")
         df_display = df_filtrato[['numero_verifica', 'data_pianificata', 'tipo_impianto', 'codice_impianto', 'fattura', 'stato', 'data_t0', 'data_t1', 'giorni_trascorsi', 'fascia_tempo', 'importo']]
         st.dataframe(df_display, use_container_width=True)
         
