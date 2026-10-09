@@ -6,10 +6,38 @@ from datetime import datetime
 from io import BytesIO
 
 # ---------------------------------------------------------
-# CONFIGURAZIONE PAGINA
+# CONFIGURAZIONE PAGINA E SICUREZZA
 # ---------------------------------------------------------
 st.set_page_config(page_title="Riconciliazione Verifiche Impianti", page_icon="📊", layout="wide")
 
+PASSWORD_ACCESSO = "Elti2026!"  # <-- Modifica qui la tua password aziendale
+
+def check_password():
+    """Restituisce True se l'utente ha inserito la password corretta."""
+    if "password_correct" not in st.session_state:
+        st.session_state["password_correct"] = False
+        
+    if not st.session_state["password_correct"]:
+        st.title("🔒 Accesso Riservato")
+        st.markdown("Inserisci la password per accedere al gestionale delle verifiche.")
+        
+        pwd = st.text_input("Password", type="password")
+        if st.button("Accedi"):
+            if pwd == PASSWORD_ACCESSO:
+                st.session_state["password_correct"] = True
+                st.rerun()
+            else:
+                st.error("Password errata. Riprova.")
+        return False
+    return True
+
+# Blocca l'esecuzione se la password non è inserita
+if not check_password():
+    st.stop()
+
+# ---------------------------------------------------------
+# DATABASE SETUP
+# ---------------------------------------------------------
 DB_NAME = "verifiche.db"
 
 def get_db_connection():
@@ -19,7 +47,7 @@ def init_db():
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    # 1. Crea la tabella base se è la primissima volta
+    # 1. Crea la tabella base
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS verifiche (
             numero_verifica INTEGER PRIMARY KEY,
@@ -36,11 +64,10 @@ def init_db():
         )
     ''')
     
-    # 2. Controlla le colonne esistenti (Migrazione automatica senza perdere dati)
+    # 2. Migrazione automatica colonne
     cursor.execute("PRAGMA table_info(verifiche)")
     colonne_esistenti = [colonna[1] for colonna in cursor.fetchall()]
     
-    # Se mancano le nuove colonne temporali, le aggiunge
     if 'giorni_trascorsi' not in colonne_esistenti:
         cursor.execute("ALTER TABLE verifiche ADD COLUMN giorni_trascorsi INTEGER")
     if 'fascia_tempo' not in colonne_esistenti:
@@ -52,13 +79,12 @@ def init_db():
 init_db()
 
 # ---------------------------------------------------------
-# SIDEBAR: BACKUP E SALVATAGGIO DATI (Protezione Cloud)
+# SIDEBAR: BACKUP E SALVATAGGIO DATI
 # ---------------------------------------------------------
 with st.sidebar:
     st.header("💾 Gestione Sicurezza Dati")
-    st.info("Su piattaforme Cloud, scarica periodicamente il database per avere un backup sicuro sul tuo PC.")
+    st.info("Scarica periodicamente il database per avere un backup sicuro sul tuo PC.")
     
-    # 1. Download Database
     if os.path.exists(DB_NAME):
         with open(DB_NAME, "rb") as f:
             st.download_button(
@@ -70,7 +96,6 @@ with st.sidebar:
             
     st.divider()
     
-    # 2. Upload Database (Ripristino)
     st.subheader("Ripristina Backup")
     uploaded_db = st.file_uploader("Carica un file .db salvato in precedenza", type=["db"])
     if uploaded_db is not None:
@@ -78,6 +103,11 @@ with st.sidebar:
             with open(DB_NAME, "wb") as f:
                 f.write(uploaded_db.getbuffer())
             st.success("Database ripristinato con successo! Ricarica la pagina.")
+            
+    st.divider()
+    if st.button("🚪 Esci (Logout)"):
+        st.session_state["password_correct"] = False
+        st.rerun()
 
 # ---------------------------------------------------------
 # INTERFACCIA PRINCIPALE
@@ -102,14 +132,11 @@ with tabs[0]:
         req_cols = ['Numero verifica', 'Protocollo', 'Codice impianto', 'Codice fiscale', 'Data pianificata', 'Importo']
         
         if all(col in df_t0.columns for col in req_cols):
-            # Normalizzazione stringhe e date
             df_t0['Protocollo'] = df_t0['Protocollo'].astype(str).str.strip().str.upper()
             df_t0['tipo_impianto'] = df_t0['Protocollo'].apply(
                 lambda x: 'Ascensori (DPR 162/99)' if x.endswith('/A') else ('Messa a Terra (DPR 462/01)' if x.endswith('/E') else 'Altro')
             )
             df_t0['Data pianificata'] = pd.to_datetime(df_t0['Data pianificata'], errors='coerce').dt.strftime('%Y-%m-%d')
-            
-            # Filtro righe valide
             df_t0 = df_t0.dropna(subset=['Numero verifica', 'Data pianificata'])
             
             st.success(f"File letto. Trovate **{len(df_t0)}** verifiche programmate.")
@@ -121,7 +148,6 @@ with tabs[0]:
                 dt0_str = data_caricamento_t0.strftime('%Y-%m-%d')
                 
                 for _, row in df_t0.iterrows():
-                    # Inserimento sicuro. Se esiste già, aggiorna i dati ma MANTIENE la data T0 originaria.
                     cursor.execute('''
                         INSERT INTO verifiche (numero_verifica, protocollo, codice_impianto, codice_fiscale, data_pianificata, importo, tipo_impianto, fattura, stato, data_t0)
                         VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'In Attesa', ?)
@@ -175,7 +201,6 @@ with tabs[1]:
                 
                 verifiche_presenti_t1 = set()
                 
-                # 1. Aggiornamento Fatture ed Età Temporale
                 for _, row in df_t1.iterrows():
                     num_ver = int(row['Numero verifica'])
                     verifiche_presenti_t1.add(num_ver)
@@ -204,7 +229,6 @@ with tabs[1]:
                             WHERE numero_verifica = ?
                         ''', (num_fat, dt1_str, giorni, fascia, num_ver))
                 
-                # 2. Identificazione Chirurgica "Non Più Presenti"
                 if date_presenti_t1:
                     placeholders = ','.join('?' for _ in date_presenti_t1)
                     query = f"SELECT numero_verifica FROM verifiche WHERE stato != 'Fatturata' AND data_pianificata IN ({placeholders})"
@@ -234,7 +258,6 @@ with tabs[2]:
         date_list = sorted(df_db['data_pianificata'].unique(), reverse=True)
         data_sel = st.selectbox("📅 Seleziona la Data Pianificata da analizzare:", ["Tutte le date"] + date_list)
         
-        # Filtraggio
         if data_sel == "Tutte le date":
             df_giorno = df_db.copy()
         else:
@@ -246,7 +269,6 @@ with tabs[2]:
         tot_non_pres = len(df_giorno[df_giorno['stato'] == 'Non Più Presente'])
         perc_conv = (tot_fat / tot_prog * 100) if tot_prog > 0 else 0.0
         
-        # -- 1. RIEPILOGO GENERALE --
         st.subheader("1. Riepilogo Volumi")
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Totale Programmate", tot_prog)
@@ -256,7 +278,6 @@ with tabs[2]:
         
         st.divider()
         
-        # -- 2. CONFRONTO TEMPORALE --
         st.subheader(f"2. Età di Fatturazione (Dal caricamento $T_0$ al consuntivo $T_1$)")
         df_fatturate = df_giorno[df_giorno['stato'] == 'Fatturata']
         
@@ -273,7 +294,6 @@ with tabs[2]:
         
         st.divider()
         
-        # -- 3. DATI GREZZI --
         st.subheader("Dettaglio Verifiche")
         df_display = df_giorno[['numero_verifica', 'data_pianificata', 'tipo_impianto', 'codice_impianto', 'fattura', 'stato', 'data_t0', 'data_t1', 'giorni_trascorsi', 'fascia_tempo', 'importo']]
         st.dataframe(df_display, use_container_width=True)
