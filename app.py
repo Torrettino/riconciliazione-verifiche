@@ -13,6 +13,8 @@ from io import BytesIO
 # CONFIGURAZIONE PAGINA E SICUREZZA
 # ---------------------------------------------------------
 st.set_page_config(page_title="Riconciliazione Verifiche Impianti", page_icon="📊", layout="wide")
+st.write("Directory di lavoro corrente:", os.getcwd())
+st.write("Esiste .streamlit/secrets.toml?", os.path.exists(os.path.join(os.getcwd(), ".streamlit", "secrets.toml")))
 
 # Password letta prioritariamente da variabile d'ambiente, altrimenti da st.secrets.
 # Accesso reso robusto per evitare fallimenti silenziosi.
