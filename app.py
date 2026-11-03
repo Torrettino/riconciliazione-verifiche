@@ -44,7 +44,8 @@ TIPO_E = 'Messa a Terra (DPR 462/01)'
 
 RINOMINA = {
     'numero_verifica': 'Numero verifica', 'protocollo': 'Protocollo', 'tipo_impianto': 'Reparto',
-    'codice_impianto': 'Codice impianto', 'data_pianificata': 'Data pianificata', 'stato': 'Stato',
+    'codice_impianto': 'Codice impianto', 'data_pianificata': 'Data pianificata',
+    'data_originaria': 'Data Originaria', 'stato': 'Stato',
     'fattura': 'Fattura', 'data_t0': 'Data T0', 'data_t1': 'Data T1',
     'verbale': 'Verbale', 'esito_verifica': 'Esito verifica',
     'verbale_da_inviare': 'Verbale da inviare / Approvato'
@@ -132,7 +133,9 @@ def init_db():
             'giorni_da_pianificata': 'INTEGER',
             'verbale': 'TEXT',
             'esito_verifica': 'TEXT',
-            'verbale_da_inviare': 'TEXT'
+            'verbale_da_inviare': 'TEXT',
+            'data_originaria': 'TEXT',
+            'is_riprogrammata': 'INTEGER'
         }
         for col_name, col_type in nuove_colonne.items():
             if col_name not in colonne:
@@ -208,7 +211,7 @@ def valida_db_caricato(raw):
 
 def carica_stato_db(conn):
     df = pd.read_sql_query(
-        "SELECT numero_verifica, protocollo, tipo_impianto, data_pianificata, data_t0, stato, verbale, esito_verifica, verbale_da_inviare FROM verifiche", conn
+        "SELECT numero_verifica, protocollo, codice_impianto, tipo_impianto, data_pianificata, data_originaria, data_t0, stato, verbale, esito_verifica, verbale_da_inviare FROM verifiche", conn
     )
     return df.set_index('numero_verifica')
 
@@ -267,14 +270,16 @@ def pianifica_t0(df_t0, db, extra_nums):
 SQL_UPSERT_T0 = '''
     INSERT INTO verifiche (
         numero_verifica, protocollo, codice_impianto, codice_fiscale, data_pianificata,
-        importo, tipo_impianto, fattura, stato, data_t0, verbale, esito_verifica, verbale_da_inviare
+        data_originaria, is_riprogrammata, importo, tipo_impianto, fattura, stato, data_t0, verbale, esito_verifica, verbale_da_inviare
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'In Attesa', ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'In Attesa', ?, ?, ?, ?)
     ON CONFLICT(numero_verifica) DO UPDATE SET
         protocollo=excluded.protocollo,
         codice_impianto=excluded.codice_impianto,
         codice_fiscale=excluded.codice_fiscale,
         data_pianificata=excluded.data_pianificata,
+        data_originaria=COALESCE(verifiche.data_originaria, excluded.data_originaria),
+        is_riprogrammata=CASE WHEN verifiche.data_originaria IS NOT NULL AND verifiche.data_originaria != excluded.data_pianificata THEN 1 ELSE verifiche.is_riprogrammata END,
         importo=COALESCE(excluded.importo, verifiche.importo),
         tipo_impianto=excluded.tipo_impianto,
         stato = CASE WHEN verifiche.fattura IS NULL THEN 'In Attesa' ELSE verifiche.stato END,
@@ -284,12 +289,20 @@ SQL_UPSERT_T0 = '''
 '''
 
 def applica_t0(conn, df_t0, dt0_str):
-    righe = [
-        (int(r.num), r.protocollo, r.codice_impianto, r.codice_fiscale, r.data_pian,
-         None if pd.isna(r.importo) else float(r.importo), r.tipo, dt0_str,
-         r.verbale, r.esito_verifica, r.verbale_da_inviare)
-        for r in df_t0.itertuples()
-    ]
+    # Recupera lo storico degli impianti per verificare se l'impianto ha una data originaria precedente
+    df_storico = pd.read_sql_query("SELECT codice_impianto, MIN(data_pianificata) as prima_data FROM verifiche GROUP BY codice_impianto", conn)
+    mappa_originaria = dict(zip(df_storico['codice_impianto'], df_storico['prima_data']))
+
+    righe = []
+    for r in df_t0.itertuples():
+        data_orig = mappa_originaria.get(r.codice_impianto, r.data_pian)
+        is_riprog = 1 if (data_orig and data_orig != r.data_pian) else 0
+        righe.append((
+            int(r.num), r.protocollo, r.codice_impianto, r.codice_fiscale, r.data_pian,
+            data_orig, is_riprog, None if pd.isna(r.importo) else float(r.importo), r.tipo, dt0_str,
+            r.verbale, r.esito_verifica, r.verbale_da_inviare
+        ))
+        
     cur = conn.cursor()
     cur.executemany(SQL_UPSERT_T0, righe)
     cur.executemany("DELETE FROM verifiche_extra WHERE numero_verifica = ?", [(int(n),) for n in df_t0['num']])
@@ -485,11 +498,15 @@ def filtra_per_intervallo_date(df, start_date, end_date):
     return df_temp.loc[mask].drop(columns=['dt_clean'])
 
 def genera_report_giornaliero(df_sub):
+    """
+    Calcola l'aggregazione giornaliera includendo la colonna 'Riprogrammate / Spostate'.
+    """
     df_a = df_sub.copy()
     
     df_a['Is_Fatturata'] = df_a['stato'] == 'Fatturata'
     df_a['Is_InAttesa'] = df_a['stato'] == 'In Attesa'
     df_a['Is_NPP'] = df_a['stato'] == 'Non Più Presente'
+    df_a['Is_Riprogrammata'] = df_a['is_riprogrammata'] == 1
     
     df_a['Ha_Verbale'] = df_a['verbale'].notna()
     df_a['Approvato'] = df_a['verbale_da_inviare'].astype(str).str.upper() == 'SI'
@@ -502,6 +519,7 @@ def genera_report_giornaliero(df_sub):
         Pianificate=('numero_verifica', 'count'),
         Fatturate=('Is_Fatturata', 'sum'),
         In_Attesa=('Is_InAttesa', 'sum'),
+        Riprogrammate=('Is_Riprogrammata', 'sum'),
         Non_Piu_Presenti=('Is_NPP', 'sum'),
         Senza_Verbale=('Senza_Verbale', 'sum'),
         In_Attesa_Ingegnere=('In_Attesa_Ingegnere', 'sum'),
@@ -511,13 +529,13 @@ def genera_report_giornaliero(df_sub):
     giornaliero['% Fatturato'] = (giornaliero['Fatturate'] / giornaliero['Pianificate'] * 100).round(1)
 
     giornaliero.columns = [
-        'Data Pianificata', 'Pianificate (T0)', 'Fatturate', 'In Attesa', 'Non Più Presenti',
+        'Data Pianificata', 'Pianificate (T0)', 'Fatturate', 'In Attesa', 'Riprogrammate / Spostate', 'Non Più Presenti',
         'In Attesa: Senza Verbale', 'In Attesa: Firma Ing.', 'In Attesa: Pronta Fattura', '% Fatturato'
     ]
 
     return giornaliero[[
         'Data Pianificata', 'Pianificate (T0)', 'Fatturate', '% Fatturato', 'In Attesa',
-        'In Attesa: Senza Verbale', 'In Attesa: Firma Ing.', 'In Attesa: Pronta Fattura', 'Non Più Presenti'
+        'Riprogrammate / Spostate', 'In Attesa: Senza Verbale', 'In Attesa: Firma Ing.', 'In Attesa: Pronta Fattura', 'Non Più Presenti'
     ]]
 
 def costruisci_excel(df_filtrato, df_extra, descrizione_periodo):
@@ -530,7 +548,7 @@ def costruisci_excel(df_filtrato, df_extra, descrizione_periodo):
     g_asc = genera_report_giornaliero(df_asc) if not df_asc.empty else pd.DataFrame()
     g_mat = genera_report_giornaliero(df_mat) if not df_mat.empty else pd.DataFrame()
 
-    col_det = ['numero_verifica', 'protocollo', 'tipo_impianto', 'codice_impianto', 'data_pianificata', 'stato',
+    col_det = ['numero_verifica', 'protocollo', 'tipo_impianto', 'codice_impianto', 'data_originaria', 'data_pianificata', 'stato',
                'verbale', 'esito_verifica', 'verbale_da_inviare', 'fattura', 'data_t0', 'data_t1']
 
     with pd.ExcelWriter(buf, engine='openpyxl') as writer:
@@ -548,6 +566,8 @@ def costruisci_excel(df_filtrato, df_extra, descrizione_periodo):
             
         df_filtrato[df_filtrato['stato'] == 'In Attesa'][col_det].rename(columns=RINOMINA).to_excel(
             writer, sheet_name='In Attesa', index=False)
+        df_filtrato[df_filtrato['is_riprogrammata'] == 1][col_det].rename(columns=RINOMINA).to_excel(
+            writer, sheet_name='Riprogrammate', index=False)
         df_filtrato[df_filtrato['stato'] == 'Non Più Presente'][col_det].rename(columns=RINOMINA).to_excel(
             writer, sheet_name='Non Più Presenti', index=False)
         df_extra.to_excel(writer, sheet_name='Fuori Programmazione', index=False)
@@ -570,6 +590,7 @@ def mostra_sezione_report_giornaliero(df_sub, nome_titolo):
     tot_pian = report_df['Pianificate (T0)'].sum()
     tot_fat = report_df['Fatturate'].sum()
     tot_att = report_df['In Attesa'].sum()
+    tot_riprog = report_df['Riprogrammate / Spostate'].sum()
     tot_npp = report_df['Non Più Presenti'].sum()
     pct_fat = (tot_fat / tot_pian * 100) if tot_pian else 0.0
 
@@ -577,8 +598,8 @@ def mostra_sezione_report_giornaliero(df_sub, nome_titolo):
     k1.metric("Pianificate (T0)", tot_pian)
     k2.metric("Fatturate", tot_fat, f"{pct_fat:.1f}% conv.")
     k3.metric("In Attesa di Fattura", tot_att)
-    k4.metric("Non Più Presenti", tot_npp)
-    k5.metric("% Conversione", f"{pct_fat:.1f}%")
+    k4.metric("Riprogrammate / Spostate", tot_riprog)
+    k5.metric("Non Più Presenti", tot_npp)
 
     st.markdown(f"##### 📊 Dettaglio Giornaliero — {nome_titolo}")
     st.dataframe(report_df, use_container_width=True, hide_index=True)
@@ -586,7 +607,7 @@ def mostra_sezione_report_giornaliero(df_sub, nome_titolo):
     st.markdown(f"##### 📈 Grafico di Conversione Giornaliera — {nome_titolo}")
     st.bar_chart(
         report_df.set_index('Data Pianificata')[
-            ['Fatturate', 'In Attesa', 'Non Più Presenti']
+            ['Fatturate', 'In Attesa', 'Riprogrammate / Spostate', 'Non Più Presenti']
         ]
     )
 
@@ -653,7 +674,7 @@ with st.sidebar:
 
 # ---------------- INTERFACCIA PRINCIPALE ----------------
 st.title("📊 Gestione & Riconciliazione Verifiche")
-st.markdown("Monitoraggio quotidiano programmate, fatturate, in attesa e assenti per reparto ($T_0 \\to T_1$)")
+st.markdown("Monitoraggio quotidiano programmate, fatturate, riprogrammate e assenti per reparto ($T_0 \\to T_1$)")
 
 tabs = st.tabs(["📥 1. Import Programmate (T0)", "🔄 2. Import Consuntivo (T1)", "📊 3. Report Giornaliero per Reparto"])
 
@@ -753,7 +774,6 @@ with tabs[2]:
         df_extra = pd.read_sql_query("SELECT * FROM verifiche_extra", conn)
     
     if not df_db.empty:
-        # Pulisce le date trovando la minima e la massima del database
         s_dates = pd.to_datetime(df_db['data_pianificata'], errors='coerce')
         valid_dates = s_dates.dropna()
         
@@ -780,7 +800,6 @@ with tabs[2]:
                 max_value=max_date
             )
             
-            # Gestisce sia quando l'utente ha selezionato entrambe le date, sia il primo clic
             if isinstance(date_range, (tuple, list)):
                 if len(date_range) == 2:
                     start_date, end_date = date_range
@@ -802,7 +821,6 @@ with tabs[2]:
 
         st.markdown("---")
         
-        # Schede dinamiche
         tab_asc, tab_mat, tab_tot = st.tabs([
             "🛗 Ascensori (Sez. /A)", 
             "⚡ Messa a Terra (Sez. /E)", 
@@ -822,9 +840,9 @@ with tabs[2]:
 
         st.markdown("---")
         st.subheader("📋 Dettaglio Completo Verifiche Filtrate")
-        df_display = df_filtrato[['numero_verifica', 'data_pianificata', 'tipo_impianto', 'codice_impianto', 
-                                  'verbale', 'esito_verifica', 'verbale_da_inviare', 'fattura', 'stato',
-                                  'data_t0', 'data_t1']]
+        df_display = df_filtrato[['numero_verifica', 'protocollo', 'tipo_impianto', 'codice_impianto', 
+                                  'data_originaria', 'data_pianificata', 'verbale', 'esito_verifica', 
+                                  'verbale_da_inviare', 'fattura', 'stato', 'data_t0', 'data_t1']]
         st.dataframe(df_display.rename(columns=RINOMINA), hide_index=True)
     else:
         st.info("Nessun dato salvato nel sistema. Effettua un primo caricamento nel Tab 1.")
