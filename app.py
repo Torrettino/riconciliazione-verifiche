@@ -56,7 +56,6 @@ RINOMINA = {
 # =========================================================
 
 def pulisci_testo(v):
-    """Pulisce i valori vuoti o formattati in modo non standard."""
     if v is None:
         return None
     try:
@@ -72,7 +71,6 @@ def pulisci_testo(v):
     return s
 
 def _parse_una_data(v):
-    """Normalizza la data nel formato ISO YYYY-MM-DD."""
     t = pulisci_testo(v)
     if t is None:
         return None
@@ -83,7 +81,6 @@ def _parse_una_data(v):
     return None if pd.isna(dt) else dt.strftime('%Y-%m-%d')
 
 def tipo_da_protocollo(protocollo):
-    """Riconosce il reparto (/A per Ascensori, /E per Messa a Terra)."""
     p = (pulisci_testo(protocollo) or '').upper()
     if p.endswith('/A'):
         return TIPO_A
@@ -92,14 +89,12 @@ def tipo_da_protocollo(protocollo):
     return None
 
 def leggi_excel(file):
-    """Legge un file Excel normalizzando i nomi delle colonne."""
     df = pd.read_excel(file, dtype=str)
     df.columns = [str(c).strip() for c in df.columns]
     return df
 
 @contextmanager
 def db_connection(commit=False):
-    """Gestisce l'apertura e la chiusura della connessione al database SQLite."""
     conn = sqlite3.connect(DB_NAME)
     try:
         yield conn
@@ -112,14 +107,9 @@ def db_connection(commit=False):
         conn.close()
 
 def esegui_migrazione_database(conn):
-    """
-    Rileva automaticamente ed applica la data originaria e la marcatura
-    'is_riprogrammata = 1' a tutte le verifiche nel database dove lo stesso
-    codice_impianto è presente con una data di programmazione successiva.
-    """
+    """Sincronizza le date originarie e lo stato di riprogrammazione in base ai dati storici."""
     cur = conn.cursor()
     
-    # 1. Imposta data_originaria pari alla prima data di programmazione trovata per ciascun codice_impianto
     cur.execute('''
         UPDATE verifiche
         SET data_originaria = (
@@ -130,7 +120,6 @@ def esegui_migrazione_database(conn):
         WHERE data_originaria IS NULL OR data_originaria = ''
     ''')
     
-    # 2. Imposta is_riprogrammata = 1 se la data pianificata è diversa dalla data originaria
     cur.execute('''
         UPDATE verifiche
         SET is_riprogrammata = 1
@@ -140,7 +129,6 @@ def esegui_migrazione_database(conn):
     conn.commit()
 
 def init_db():
-    """Inizializza il database e le colonne necessarie, eseguendo la migrazione dei dati."""
     with db_connection(commit=True) as conn:
         cursor = conn.cursor()
         cursor.execute('''
@@ -186,11 +174,9 @@ def init_db():
             )
         ''')
         
-        # Esegue la sincronizzazione retroattiva per le verifiche riprogrammate
         esegui_migrazione_database(conn)
 
 def crea_backup(motivo="auto"):
-    """Crea una copia di sicurezza (.db) prima delle modifiche salienti."""
     if not os.path.exists(DB_NAME):
         return None
     os.makedirs(BACKUP_DIR, exist_ok=True)
@@ -329,8 +315,7 @@ SQL_UPSERT_T0 = '''
         verbale_da_inviare = COALESCE(excluded.verbale_da_inviare, verifiche.verbale_da_inviare)
 '''
 
-def applica_t0(conn, df_t0, dt0_str):
-    # Recupera la data originaria storica per numero_verifica e per codice_impianto
+def applica_t0(conn, df_t0):
     df_db = pd.read_sql_query("SELECT numero_verifica, codice_impianto, data_pianificata, data_originaria FROM verifiche", conn)
     
     map_num_orig = {}
@@ -358,9 +343,10 @@ def applica_t0(conn, df_t0, dt0_str):
             
         is_riprog = 1 if (data_orig and data_orig != dt_new) else 0
 
+        # La data T0 viene impostata direttamente pari alla data_pianificata del file
         righe.append((
             num, r.protocollo, cod, r.codice_fiscale, dt_new,
-            data_orig, is_riprog, None if pd.isna(r.importo) else float(r.importo), r.tipo, dt0_str,
+            data_orig, is_riprog, None if pd.isna(r.importo) else float(r.importo), r.tipo, dt_new,
             r.verbale, r.esito_verifica, r.verbale_da_inviare
         ))
         
@@ -368,7 +354,6 @@ def applica_t0(conn, df_t0, dt0_str):
     cur.executemany(SQL_UPSERT_T0, righe)
     cur.executemany("DELETE FROM verifiche_extra WHERE numero_verifica = ?", [(int(n),) for n in df_t0['num']])
     
-    # Riesegue la sincronizzazione per mantenere coerenti le date originarie
     esegui_migrazione_database(conn)
     logger.info("T0 applicato: %d verifiche", len(righe))
 
@@ -411,12 +396,13 @@ def rileva_reparti_t1(d, db):
             conteggio[tipo] = conteggio.get(tipo, 0) + 1
     return conteggio
 
-def _processa_riga_t1(r, db_d, dt1, dt1_str):
+def _processa_riga_t1(r, db_d):
     num = int(r.num)
     fattura = _txt(r.fattura)
     verbale = _txt(r.verbale)
     esito = _txt(r.esito_verifica)
     v_inviare = _txt(r.verbale_da_inviare)
+    dt1_str = _txt(r.data_pian)
     rec = db_d.get(num)
 
     if rec is None:
@@ -424,13 +410,14 @@ def _processa_riga_t1(r, db_d, dt1, dt1_str):
         tipo = tipo_da_protocollo(protocollo) if protocollo else None
         if protocollo and tipo is None:
             return 'scartata_altro', None
-        return 'extra', (num, protocollo, tipo, _txt(r.data_pian), fattura, dt1_str)
+        return 'extra', (num, protocollo, tipo, dt1_str, fattura, dt1_str)
 
     if rec['stato'] == 'Fatturata':
         return 'gia_fatturata', None
 
     if fattura:
-        return 'fatturata', (fattura, dt1_str, 0, 'N/D', 0, verbale, esito, v_inviare, num)
+        # La data T1 viene salvata prendendo la data pianificata del file T1
+        return 'fatturata', (fattura, dt1_str or rec['data_pianificata'], 0, 'N/D', 0, verbale, esito, v_inviare, num)
 
     if rec['stato'] == 'Non Più Presente':
         return 'riattivata', (verbale, esito, v_inviare, num)
@@ -449,8 +436,7 @@ def _calcola_npp(db_d, presenti, date_t1, reparti_coperti):
                 npp.append(int(num))
     return base_attesa, npp
 
-def pianifica_t1(d, dt1, db, reparti_coperti):
-    dt1_str = dt1.strftime('%Y-%m-%d')
+def pianifica_t1(d, db, reparti_coperti):
     db_d = db.to_dict('index')
     presenti = set(d['num'].tolist())
     date_t1 = {x for x in (_txt(v) for v in d['data_pian']) if x}
@@ -459,7 +445,7 @@ def pianifica_t1(d, dt1, db, reparti_coperti):
     gia_fatturate = senza_fattura = scartate_altro = 0
 
     for r in d.itertuples():
-        esito, payload = _processa_riga_t1(r, db_d, dt1, dt1_str)
+        esito, payload = _processa_riga_t1(r, db_d)
         if esito == 'fatturata':
             fatturate.append(payload)
         elif esito == 'riattivata':
@@ -480,7 +466,7 @@ def pianifica_t1(d, dt1, db, reparti_coperti):
     pct_npp = (len(npp) / base_attesa) if base_attesa else 0.0
 
     return {
-        'dt1_str': dt1_str,
+        'dt1_str': ", ".join(sorted(list(date_t1))),
         'tot_righe': len(d),
         'date_t1': date_t1,
         'reparti_coperti': list(reparti_coperti),
@@ -541,7 +527,6 @@ def applica_t1(conn, piano):
                     [(n,) for n in piano['npp']])
     cur.executemany(SQL_UPSERT_EXTRA, piano['extra'])
     
-    # Sincronizza le date originarie e lo stato riprogrammato
     esegui_migrazione_database(conn)
     logger.info("T1 applicato con successo.")
 
@@ -565,9 +550,7 @@ def filtra_per_intervallo_date(df, start_date, end_date):
     return df_temp.loc[mask].drop(columns=['dt_clean'])
 
 def genera_report_giornaliero(df_sub):
-    """
-    Calcola l'aggregazione giornaliera includendo la colonna 'Riprogrammate / Spostate'.
-    """
+    """Calcola l'aggregazione giornaliera basata sulle date presenti nel database."""
     df_a = df_sub.copy()
     
     df_a['Is_Fatturata'] = df_a['stato'] == 'Fatturata'
@@ -748,8 +731,6 @@ tabs = st.tabs(["📥 1. Import Programmate (T0)", "🔄 2. Import Consuntivo (T
 # ---------------- TAB 1: IMPORT T0 ----------------
 with tabs[0]:
     st.header("1. Caricamento Estrapolazione Programmate (T0)")
-    c1, c2 = st.columns([1, 2])
-    data_caricamento_t0 = c1.date_input("Data di acquisizione (T0):", datetime.today(), key="d_t0")
     file_t0 = st.file_uploader("Trascina il file Excel delle Programmate", type=["xlsx", "xls"], key="file_t0")
     if file_t0:
         df_raw_t0 = leggi_excel(file_t0)
@@ -779,16 +760,13 @@ with tabs[0]:
             
             if st.button("💾 Salva Programmazione (T0) nel Database", type="primary", disabled=df_t0.empty):
                 crea_backup("pre-T0")
-                dt0_str = data_caricamento_t0.strftime('%Y-%m-%d')
                 with db_connection(commit=True) as conn:
-                    applica_t0(conn, df_t0, dt0_str)
-                st.success(f"Dati salvati con successo. Data di caricamento originaria ($T_0$): {dt0_str}")
+                    applica_t0(conn, df_t0)
+                st.success("Dati programmazione (T0) salvati con successo nel database!")
 
 # ---------------- TAB 2: IMPORT T1 ----------------
 with tabs[1]:
     st.header("2. Riconciliazione Consuntivo / Emissione Fatture (T1)")
-    c1, c2 = st.columns([1, 2])
-    data_caricamento_t1 = c1.date_input("Data del controllo consuntivo (T1):", datetime.today(), key="d_t1")
     file_t1 = st.file_uploader("Trascina il file Excel aggiornato con Fatture", type=["xlsx", "xls"], key="file_t1")
     if file_t1:
         df_raw_t1 = leggi_excel(file_t1)
@@ -807,8 +785,7 @@ with tabs[1]:
                 [TIPO_A, TIPO_E], default=default_reparti,
                 key=f"reparti_t1_{file_t1.name}_{file_t1.size}"
             )
-            piano = pianifica_t1(d1, data_caricamento_t1.date() if isinstance(data_caricamento_t1, datetime) else data_caricamento_t1,
-                                 db_stato, reparti_coperti)
+            piano = pianifica_t1(d1, db_stato, reparti_coperti)
             
             st.markdown("### 🔍 Anteprima riconciliazione")
             riepilogo, quadra = riepilogo_piano(piano, info1)
@@ -831,7 +808,7 @@ with tabs[1]:
                 crea_backup("pre-T1")
                 with db_connection(commit=True) as conn:
                     applica_t1(conn, piano)
-                st.success(f"Riconciliazione completata rispetto alla data $T_1 = {piano['dt1_str']}$!")
+                st.success("Riconciliazione consuntivo (T1) completata con successo!")
 
 # ---------------- TAB 3: REPORT GIORNALIERO E RIELABORATO ----------------
 with tabs[2]:
