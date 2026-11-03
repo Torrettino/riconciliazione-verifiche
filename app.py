@@ -56,6 +56,7 @@ RINOMINA = {
 # =========================================================
 
 def pulisci_testo(v):
+    """Pulisce i valori vuoti o formattati in modo non standard."""
     if v is None:
         return None
     try:
@@ -71,6 +72,7 @@ def pulisci_testo(v):
     return s
 
 def _parse_una_data(v):
+    """Normalizza la data nel formato ISO YYYY-MM-DD."""
     t = pulisci_testo(v)
     if t is None:
         return None
@@ -81,6 +83,7 @@ def _parse_una_data(v):
     return None if pd.isna(dt) else dt.strftime('%Y-%m-%d')
 
 def tipo_da_protocollo(protocollo):
+    """Riconosce il reparto (/A per Ascensori, /E per Messa a Terra)."""
     p = (pulisci_testo(protocollo) or '').upper()
     if p.endswith('/A'):
         return TIPO_A
@@ -89,12 +92,14 @@ def tipo_da_protocollo(protocollo):
     return None
 
 def leggi_excel(file):
+    """Legge un file Excel normalizzando i nomi delle colonne."""
     df = pd.read_excel(file, dtype=str)
     df.columns = [str(c).strip() for c in df.columns]
     return df
 
 @contextmanager
 def db_connection(commit=False):
+    """Gestisce l'apertura e la chiusura della connessione al database SQLite."""
     conn = sqlite3.connect(DB_NAME)
     try:
         yield conn
@@ -106,7 +111,36 @@ def db_connection(commit=False):
     finally:
         conn.close()
 
+def esegui_migrazione_database(conn):
+    """
+    Rileva automaticamente ed applica la data originaria e la marcatura
+    'is_riprogrammata = 1' a tutte le verifiche nel database dove lo stesso
+    codice_impianto è presente con una data di programmazione successiva.
+    """
+    cur = conn.cursor()
+    
+    # 1. Imposta data_originaria pari alla prima data di programmazione trovata per ciascun codice_impianto
+    cur.execute('''
+        UPDATE verifiche
+        SET data_originaria = (
+            SELECT MIN(v2.data_pianificata)
+            FROM verifiche v2
+            WHERE v2.codice_impianto = verifiche.codice_impianto
+        )
+        WHERE data_originaria IS NULL OR data_originaria = ''
+    ''')
+    
+    # 2. Imposta is_riprogrammata = 1 se la data pianificata è diversa dalla data originaria
+    cur.execute('''
+        UPDATE verifiche
+        SET is_riprogrammata = 1
+        WHERE data_originaria IS NOT NULL 
+          AND data_originaria != data_pianificata
+    ''')
+    conn.commit()
+
 def init_db():
+    """Inizializza il database e le colonne necessarie, eseguendo la migrazione dei dati."""
     with db_connection(commit=True) as conn:
         cursor = conn.cursor()
         cursor.execute('''
@@ -135,7 +169,7 @@ def init_db():
             'esito_verifica': 'TEXT',
             'verbale_da_inviare': 'TEXT',
             'data_originaria': 'TEXT',
-            'is_riprogrammata': 'INTEGER'
+            'is_riprogrammata': 'INTEGER DEFAULT 0'
         }
         for col_name, col_type in nuove_colonne.items():
             if col_name not in colonne:
@@ -151,8 +185,12 @@ def init_db():
                 data_t1 TEXT
             )
         ''')
+        
+        # Esegue la sincronizzazione retroattiva per le verifiche riprogrammate
+        esegui_migrazione_database(conn)
 
 def crea_backup(motivo="auto"):
+    """Crea una copia di sicurezza (.db) prima delle modifiche salienti."""
     if not os.path.exists(DB_NAME):
         return None
     os.makedirs(BACKUP_DIR, exist_ok=True)
@@ -279,7 +317,10 @@ SQL_UPSERT_T0 = '''
         codice_fiscale=excluded.codice_fiscale,
         data_pianificata=excluded.data_pianificata,
         data_originaria=COALESCE(verifiche.data_originaria, excluded.data_originaria),
-        is_riprogrammata=CASE WHEN verifiche.data_originaria IS NOT NULL AND verifiche.data_originaria != excluded.data_pianificata THEN 1 ELSE verifiche.is_riprogrammata END,
+        is_riprogrammata=CASE 
+            WHEN COALESCE(verifiche.data_originaria, excluded.data_originaria) != excluded.data_pianificata THEN 1 
+            ELSE verifiche.is_riprogrammata 
+        END,
         importo=COALESCE(excluded.importo, verifiche.importo),
         tipo_impianto=excluded.tipo_impianto,
         stato = CASE WHEN verifiche.fattura IS NULL THEN 'In Attesa' ELSE verifiche.stato END,
@@ -289,16 +330,36 @@ SQL_UPSERT_T0 = '''
 '''
 
 def applica_t0(conn, df_t0, dt0_str):
-    # Recupera lo storico degli impianti per verificare se l'impianto ha una data originaria precedente
-    df_storico = pd.read_sql_query("SELECT codice_impianto, MIN(data_pianificata) as prima_data FROM verifiche GROUP BY codice_impianto", conn)
-    mappa_originaria = dict(zip(df_storico['codice_impianto'], df_storico['prima_data']))
+    # Recupera la data originaria storica per numero_verifica e per codice_impianto
+    df_db = pd.read_sql_query("SELECT numero_verifica, codice_impianto, data_pianificata, data_originaria FROM verifiche", conn)
+    
+    map_num_orig = {}
+    for r in df_db.itertuples():
+        map_num_orig[r.numero_verifica] = r.data_originaria or r.data_pianificata
+
+    map_cod_orig = {}
+    for r in df_db.itertuples():
+        orig = r.data_originaria or r.data_pianificata
+        if r.codice_impianto not in map_cod_orig or orig < map_cod_orig[r.codice_impianto]:
+            map_cod_orig[r.codice_impianto] = orig
 
     righe = []
     for r in df_t0.itertuples():
-        data_orig = mappa_originaria.get(r.codice_impianto, r.data_pian)
-        is_riprog = 1 if (data_orig and data_orig != r.data_pian) else 0
+        num = int(r.num)
+        cod = r.codice_impianto
+        dt_new = r.data_pian
+        
+        if num in map_num_orig:
+            data_orig = map_num_orig[num]
+        elif cod in map_cod_orig:
+            data_orig = map_cod_orig[cod]
+        else:
+            data_orig = dt_new
+            
+        is_riprog = 1 if (data_orig and data_orig != dt_new) else 0
+
         righe.append((
-            int(r.num), r.protocollo, r.codice_impianto, r.codice_fiscale, r.data_pian,
+            num, r.protocollo, cod, r.codice_fiscale, dt_new,
             data_orig, is_riprog, None if pd.isna(r.importo) else float(r.importo), r.tipo, dt0_str,
             r.verbale, r.esito_verifica, r.verbale_da_inviare
         ))
@@ -306,6 +367,9 @@ def applica_t0(conn, df_t0, dt0_str):
     cur = conn.cursor()
     cur.executemany(SQL_UPSERT_T0, righe)
     cur.executemany("DELETE FROM verifiche_extra WHERE numero_verifica = ?", [(int(n),) for n in df_t0['num']])
+    
+    # Riesegue la sincronizzazione per mantenere coerenti le date originarie
+    esegui_migrazione_database(conn)
     logger.info("T0 applicato: %d verifiche", len(righe))
 
 # ---------------- PREPARAZIONE E SALVATAGGIO T1 ----------------
@@ -476,6 +540,9 @@ def applica_t1(conn, piano):
     cur.executemany("UPDATE verifiche SET stato = 'Non Più Presente' WHERE numero_verifica = ?",
                     [(n,) for n in piano['npp']])
     cur.executemany(SQL_UPSERT_EXTRA, piano['extra'])
+    
+    # Sincronizza le date originarie e lo stato riprogrammato
+    esegui_migrazione_database(conn)
     logger.info("T1 applicato con successo.")
 
 # =========================================================
