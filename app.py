@@ -264,7 +264,6 @@ def pianifica_t0(df_t0, db, extra_nums):
     da_extra = len(set(df_t0['num']) & set(extra_nums))
     return {'nuove': nuove, 'presenti': presenti, 'date_cambiate': date_cambiate, 'da_extra': da_extra}
 
-# ERRORE CORRETTO QUI: c'erano discrepanze tra i nomi colonna, il numero di ? e l'UPDATE
 SQL_UPSERT_T0 = '''
     INSERT INTO verifiche (
         numero_verifica, protocollo, codice_impianto, codice_fiscale, data_pianificata,
@@ -306,7 +305,7 @@ def prepara_t1(df_raw):
                        if 'Protocollo' in df_raw.columns else None),
         'verbale': df_raw['Verbale'].apply(pulisci_testo) if 'Verbale' in df_raw.columns else None,
         'esito_verifica': df_raw['Esito verifica'].apply(pulisci_testo) if 'Esito verifica' in df_raw.columns else None,
-        'verbale_da_inviare': df_raw['Verbale da_inviare'].apply(pulisci_testo) if 'Verbale da inviare' in df_raw.columns else None,
+        'verbale_da_inviare': df_raw['Verbale da inviare'].apply(pulisci_testo) if 'Verbale da inviare' in df_raw.columns else None,
     })
     m_num = d['num'].isna()
     d = d[~m_num].copy()
